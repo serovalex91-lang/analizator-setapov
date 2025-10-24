@@ -1,0 +1,9 @@
+﻿venv/
+__pycache__/
+*.pyc
+*.log
+*.session
+levels.db
+intraday-levels-taapi/.env
+raw_messages.log
+messages.log
