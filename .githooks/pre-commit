@@ -1,0 +1,36 @@
+#!/bin/sh
+# Block commits if tests fail
+
+set -eu
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+VENV_ACTIVATE="${REPO_ROOT}/venv/bin/activate"
+
+# Prefer project venv if present
+if [ -f "$VENV_ACTIVATE" ]; then
+  # shellcheck disable=SC1090
+  . "$VENV_ACTIVATE"
+fi
+
+# Ensure Python can import repository modules
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# Run tests (scope to tests/ to avoid collecting ad-hoc scripts)
+if command -v pytest >/dev/null 2>&1; then
+  if [ -d "$REPO_ROOT/tests" ]; then
+    echo "[pre-commit] Running pytest on tests/ ..."
+    pytest -q "$REPO_ROOT/tests"
+  else
+    echo "[pre-commit] No tests/ directory found; skipping tests"
+    exit 0
+  fi
+else
+  echo "[pre-commit] pytest not found. Install it in venv to enforce tests."
+  exit 1
+fi
+
+echo "[pre-commit] Tests passed. Proceeding with commit."
+exit 0
+
+
+

@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: intraday-levels-taapi
+    working_dir: /app/intraday-levels-taapi
+    command: bash -lc "python -m uvicorn app.main_v2:app --host 0.0.0.0 --port 8001"
+    env_file:
+      - .env
+      - intraday-levels-taapi/.env
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./:/app:ro
+    restart: unless-stopped
+
+  userbot:
+    build: .
+    container_name: userbot
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    # Передадим путь до сессии из volume; если нет — бот создаст её и вы запросите код
+    environment:
+      SETUP_MAX_AGE_HOURS: "12"
+      GO_SHORT_ENABLED: "1"
+      GO_LONG_ENABLED: "1"
+    env_file:
+      - .env
+    command: bash -lc "python userbot.py"
+    volumes:
+      - ./:/app
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # newbot:
+  #   build: .
+  #   container_name: newbot
+  #   working_dir: /app
+  #   environment:
+  #     SETUP_MAX_AGE_HOURS: "12"
+  #   env_file:
+  #     - .env
+  #   command: bash -lc "python newbot.py"
+  #   volumes:
+  #     - ./:/app
+  #     - userbot_sessions:/app
+  #   depends_on:
+  #     - api
+  #   restart: unless-stopped
+
+volumes:
+  userbot_sessions:
+    driver: local
+
+
