@@ -394,6 +394,12 @@ def build_llm_payload(parsed: dict, taapi_bundle: dict, last_price: Optional[flo
         },
         "meta": {"source": "telegram_bot", "timestamp_utc": None}
     }
+    # Передаём жёсткий стоп явно в payload для LLM (hint):
+    try:
+        if sl is not None:
+            payload["grid"] = {"hard_stop": float(sl)}
+    except Exception:
+        pass
     return payload
 
 def make_human_preview(payload: dict) -> str:
@@ -424,6 +430,7 @@ def make_human_preview(payload: dict) -> str:
         f"DMI 4h (DI+/DI-): { dmi4.get('di_plus') } / { dmi4.get('di_minus') }",
         f"DMI 12h (DI+/DI-): { dmi12.get('di_plus') } / { dmi12.get('di_minus') }",
         f"MACD_hist 4h/12h: { (macd4 or {}).get('hist') } / { (macd12 or {}).get('hist') }",
+        f"ATR 4h/12h: { (ta.get('atr') or {}).get('4h') } / { (ta.get('atr') or {}).get('12h') }",
         f"BB width 4h: {bbw}{bbw_note} | OBV 4h: {obv}",
         f"RSI12h: {filt.get('rsi_12h')} | EMA200 12h: {filt.get('ema200_12h')} | Px>MA200?: {filt.get('price_above_ma200_12h')}",
         f"Funding: {mc.get('funding_rate')} | OI Δ24h%: {mc.get('open_interest_change_24h_pct')}",
@@ -529,25 +536,32 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
         # если пришли subscores — считаем итоговый score в коде
         try:
             WEIGHTS = {
-                "trend_align":0.15, "dmi_spread":0.10, "adx_strength":0.15, "macd_momentum":0.15,
-                "rsi_state":0.10, "vol_regime":0.10, "obv_flow":0.05, "levels_quality":0.10,
-                "market_ctx":0.07, "staleness":0.03
+                "trend_align":0.15, "dmi_spread":0.12, "adx_strength":0.12, "macd_momentum":0.15,
+                "rsi_state":0.08, "vol_regime":0.10, "obv_flow":0.06, "levels_quality":0.12,
+                "market_ctx":0.07, "structure":0.03
             }
             if isinstance(llm_result, dict) and isinstance(llm_result.get("subscores"), dict):
                 sub = llm_result["subscores"]
                 base = 0.0
                 for k, w in WEIGHTS.items():
                     try:
-                        base += w * float(sub.get(k, 0) or 0)
+                        base += w * float(sub.get(k, 50) or 50)
                     except Exception:
                         pass
                 score = int(round(base))
+                # мягкие штрафы с ограничением сверху
                 flags = llm_result.get("flags") or []
+                penalty = 0
                 if isinstance(flags, list):
-                    if "counter_trend" in flags:
-                        score -= 7
-                    if "adx_low" in flags:
-                        score -= 5
+                    soft_map = {
+                        "adx_low":5, "dmi_conflict":6, "macd_diverge":6, "range_risk":8,
+                        "counter_trend":10, "entry_far":5, "sl_tight":6, "tp_optimistic":6,
+                        "missing_data":4
+                    }
+                    for f in flags:
+                        penalty += soft_map.get(f, 0)
+                penalty = min(penalty, 20)
+                score = int(round(base - penalty))
                 score = max(0, min(100, score))
                 llm_result["score"] = score
                 llm_result["confidence"] = max(1, min(10, int(round(score/10))))
@@ -559,6 +573,249 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
                 _conf = int(max(1, min(10, round(float(llm_result.get("score")) / 10))))
                 llm_result["confidence"] = _conf
                 llm_result["confidence_text"] = f"{_conf*10}% уверенности"
+        except Exception:
+            pass
+        # Маппинг вердикта по шкале
+        try:
+            if isinstance(llm_result, dict) and isinstance(llm_result.get("score"), (int, float)):
+                sc = int(llm_result["score"])
+                def _map_verdict(score: int) -> str:
+                    if score >= 90:
+                        return "high"
+                    if score >= 75:
+                        return "strong"
+                    if score >= 60:
+                        return "moderate"
+                    if score >= 1:
+                        return "weak"
+                    return "invalid"
+                llm_result["verdict"] = _map_verdict(sc)
+        except Exception:
+            pass
+        # Коррекция range_risk по BB-width
+        try:
+            flags = llm_result.get("flags") or []
+            if not isinstance(flags, list):
+                flags = []
+            bbw = ((llm_payload.get("taapi") or {}).get("bb_width") or {}).get("4h")
+            if isinstance(bbw, (int, float)):
+                if bbw < 0.025 and "range_risk" not in flags:
+                    flags.append("range_risk")
+                if bbw >= 0.025 and "range_risk" in flags:
+                    flags = [f for f in flags if f != "range_risk"]
+            llm_result["flags"] = flags
+        except Exception:
+            pass
+        # Коррекция флага dmi_conflict (убираем ложноположительный)
+        try:
+            flags = llm_result.get("flags") or []
+            if isinstance(flags, list) and ("dmi_conflict" in flags):
+                dmi = (llm_payload.get("taapi") or {}).get("dmi") or {}
+                d4 = dmi.get("4h") or {}
+                d12 = dmi.get("12h") or {}
+                dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+                def _sp(d: dict) -> float:
+                    try:
+                        return float((d.get("di_plus") or 0) - (d.get("di_minus") or 0))
+                    except Exception:
+                        return 0.0
+                sp4 = _sp(d4)
+                sp12 = _sp(d12)
+                small4 = abs(sp4) < 3
+                small12 = abs(sp12) < 3
+                conflict = False
+                if dirn == "long":
+                    conflict = ((sp4 <= 0 and sp12 <= 0) or (small4 and small12))
+                elif dirn == "short":
+                    conflict = ((sp4 >= 0 and sp12 >= 0) or (small4 and small12))
+                if not conflict:
+                    llm_result["flags"] = [f for f in flags if f != "dmi_conflict"]
+        except Exception:
+            pass
+        # entry_far → корректная заметка в corrections
+        try:
+            flags = llm_result.get("flags") or []
+            corr = llm_result.get("corrections") or {}
+            dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+            cp = (llm_payload.get("setup_parsed") or {}).get("current_price")
+            kv = (llm_payload.get("setup_parsed") or {}).get("key_levels") or {}
+            zone_min = kv.get("min"); zone_max = kv.get("max")
+            if isinstance(flags, list) and ("entry_far" in flags):
+                # держим entry, ждём отката
+                corr["entry"] = "keep"
+                if dirn == "long":
+                    if zone_min is not None and zone_max is not None:
+                        corr["entry_note"] = f"цена выше входа; ждём откат к зоне {round(float(zone_min),4)}–{round(float(zone_max),4)}"
+                    else:
+                        corr["entry_note"] = "цена выше входа; ждём откат к входной зоне"
+                elif dirn == "short":
+                    if zone_min is not None and zone_max is not None:
+                        corr["entry_note"] = f"цена ниже входа; ждём ретест зоны {round(float(zone_min),4)}–{round(float(zone_max),4)}"
+                    else:
+                        corr["entry_note"] = "цена ниже входа; ждём ретест входной зоны"
+                llm_result["corrections"] = corr
+        except Exception:
+            pass
+        # Если proposals пусты — добавим консервативный ATR-вариант
+        try:
+            props = llm_result.get("proposals") or []
+            if not props:
+                atr4 = (llm_payload.get("taapi") or {}).get("atr", {}).get("4h")
+                entry_val = (llm_payload.get("setup_parsed") or {}).get("current_price") or (llm_payload.get("market_context") or {}).get("last_price")
+                dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+                if atr4 and entry_val:
+                    ent = float(entry_val); a = float(atr4)
+                    if dirn == "long":
+                        sl = round(ent - 1.2*a, 6)
+                        tp = round(ent + 2.4*a, 6)
+                    else:
+                        sl = round(ent + 1.2*a, 6)
+                        tp = round(ent - 2.4*a, 6)
+                    rr = abs(tp - ent) / max(1e-9, abs(ent - sl))
+                    if rr >= 1.5:
+                        llm_result["proposals"] = [{
+                            "method": "ATR", "entry": "use_current", "sl": sl, "tp": tp,
+                            "rr": round(rr, 2), "justification": "базовый ATR-профиль с RR≈2 на фоне текущей волатильности"
+                        }]
+            # если есть key_levels и ATR — попытаться дополнить KeyLevel вариантом, чтобы было не менее 2
+            props = llm_result.get("proposals") or []
+            if len(props) < 2:
+                kv = (llm_payload.get("setup_parsed") or {}).get("key_levels") or {}
+                atr4 = (llm_payload.get("taapi") or {}).get("atr", {}).get("4h")
+                dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+                # сформировать pullback только если зона подходит по направлению
+                if kv and atr4:
+                    a = float(atr4)
+                    ktype = (kv.get("type") or "").upper()
+                    kmin = kv.get("min"); kmax = kv.get("max")
+                    if kmin is not None and kmax is not None:
+                        mid = float((kmin + kmax) / 2.0)
+                        if dirn == "long" and ktype == "SUPPORT":
+                            ent = mid
+                            sl = min(float(kmin) - 0.2*a, ent - 1.2*a)
+                            tp = ent + max(2.0*a, 2.4*a)
+                        elif dirn == "short" and ktype == "RESISTANCE":
+                            ent = mid
+                            sl = max(float(kmax) + 0.2*a, ent + 1.2*a)
+                            tp = ent - max(2.0*a, 2.4*a)
+                        else:
+                            ent = None
+                        if ent is not None:
+                            rr = abs(tp - ent) / max(1e-9, abs(ent - sl))
+                            if rr >= 1.5:
+                                props.append({
+                                    "method": "KeyLevel", "entry": round(ent, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                                    "rr": round(rr, 2), "justification": "pullback к ключевой зоне, SL ниже/выше зоны, RR≥1.5"
+                                })
+                                llm_result["proposals"] = props[:3]
+        except Exception:
+            pass
+        # Обновление subscores.staleness по реальному возрасту (если есть ts)
+        try:
+            from datetime import datetime, timezone
+            def _staleness_subscore(ts_setup: Optional[str], now_dt: datetime, tf_minutes: int = 240) -> int:
+                try:
+                    if not ts_setup:
+                        return 50
+                    # простая поддержка ISO 8601 с Z
+                    ts = ts_setup
+                    if ts.endswith("Z"):
+                        ts = ts.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(ts)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_min = (now_dt - dt.astimezone(timezone.utc)).total_seconds() / 60.0
+                    if age_min <= tf_minutes:
+                        return 80
+                    if age_min <= 2 * tf_minutes:
+                        return 60
+                    if age_min <= 4 * tf_minutes:
+                        return 45
+                    return 30
+                except Exception:
+                    return 50
+
+            now_dt = datetime.now(timezone.utc)
+            subs = llm_result.get("subscores") or {}
+            if not isinstance(subs, dict):
+                subs = {}
+            # попытка взять время сетапа из parsed меты
+            ts_setup = (llm_payload.get("setup_parsed") or {}).get("_meta", {}).get("source_timestamp_utc")
+            if not ts_setup:
+                # fallback: по RSI ts
+                rsi_ts = ((llm_payload.get("taapi") or {}).get("filters") or {}).get("rsi_12h_ts")
+                if isinstance(rsi_ts, (int, float)):
+                    ts_setup = datetime.fromtimestamp(float(rsi_ts), tz=timezone.utc).isoformat()
+            subs["staleness"] = _staleness_subscore(ts_setup, now_dt, tf_minutes=240)
+            llm_result["subscores"] = subs
+        except Exception:
+            pass
+        # Коррекция debug.notes: убрать DMI-конфликт, подсветить MACD конфликт, если есть
+        try:
+            dbg = llm_result.get("debug") or {}
+            notes = str(dbg.get("notes") or "")
+            # удалить упоминание dmi_conflict, если его нет во flags
+            flags = llm_result.get("flags") or []
+            if isinstance(flags, list) and ("dmi_conflict" not in flags) and notes:
+                notes = notes.replace("dmi_conflict", "")
+            # добавить MACD конфликт, если знаки гистограмм 4h/12h различны
+            macd4 = (llm_payload.get("taapi") or {}).get("macd", {}).get("4h", {})
+            macd12 = (llm_payload.get("taapi") or {}).get("macd", {}).get("12h", {})
+            h4 = macd4.get("hist"); h12 = macd12.get("hist")
+            try:
+                if h4 is not None and h12 is not None and (float(h4) * float(h12) < 0):
+                    if "MACD 4h < 0 vs 12h > 0" not in notes and "MACD 12h < 0 vs 4h > 0" not in notes:
+                        if float(h4) < 0 < float(h12):
+                            notes = (notes + "; " if notes else "") + "MACD 4h < 0 vs 12h > 0"
+                        elif float(h12) < 0 < float(h4):
+                            notes = (notes + "; " if notes else "") + "MACD 12h < 0 vs 4h > 0"
+            except Exception:
+                pass
+            if notes:
+                dbg["notes"] = notes.strip().strip("; ")
+                llm_result["debug"] = dbg
+        except Exception:
+            pass
+        # Fallback conclusion если пусто
+        try:
+            if not llm_result.get("conclusion"):
+                dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+                is_long = dirn == "long"
+                llm_result["conclusion"] = {
+                    "headline": "Картина смешанная; ждём подтверждения тайминга",
+                    "bullets": [
+                        "Плюсы: DI+>DI− на HTF, цена выше EMA200 12h" if is_long else "Плюсы: DI−>DI+ на HTF, цена ниже EMA200 12h",
+                        "Риски: MACD_hist 4h < 0, ADX 4h на грани",
+                        "Что улучшит: MACD_hist 4h → 0+, рост ADX12h; ретест поддержки и отбой" if is_long else "Что улучшит: MACD_hist 4h → 0−, рост ADX12h; ретест сопротивления и отбой",
+                        "План: добор от зоны поддержки, SL за свинг/≥1.2×ATR, цель — ближайшее сопротивление" if is_long else "План: вход от зоны сопротивления, SL за свинг/≥1.2×ATR, цель — ближайшая поддержка",
+                    ],
+                    "invalidation": "Закрепление ниже ключевой поддержки и roll-over ADX12h" if is_long else "Закрепление выше ключевого сопротивления и roll-over ADX12h",
+                }
+        except Exception:
+            pass
+        # Fallback tactical_comment если пусто
+        try:
+            if not llm_result.get("tactical_comment"):
+                dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+                kv = (llm_payload.get("setup_parsed") or {}).get("key_levels") or {}
+                a4 = (llm_payload.get("taapi") or {}).get("atr", {}).get("4h")
+                grid = []
+                if kv:
+                    kmin = kv.get("min"); kmax = kv.get("max")
+                    if kmin is not None and kmax is not None:
+                        mid = round((float(kmin) + float(kmax)) / 2.0, 2)
+                        # простая сетка вокруг середины зоны
+                        grid = [str(round(mid + d, 1)) for d in ([0.0, -2.4, -4.8] if dirn == "long" else [0.0, 2.4, 4.8])]
+                adv = []
+                if a4:
+                    adv.append(f"SL: {'ниже' if dirn=='long' else 'выше'} зоны (~1.2×ATR)")
+                    adv.append("TP: частичная фиксация у ближайшей цель/зоны")
+                adv.append("Контроль: MACD_hist 4h → в сторону позиции, рост ADX12h")
+                llm_result["tactical_comment"] = {
+                    "summary": "Ждём отката к ключевой зоне и подтверждения тайминга (MACD/ADX), затем работаем от зоны сеткой.",
+                    "grid_levels": grid[:3],
+                    "advice": adv[:3],
+                }
         except Exception:
             pass
         # Валидация предложений уровней (proposals)
@@ -603,6 +860,173 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
             ent_fallback = llm_payload.get("setup_parsed", {}).get("current_price") or llm_payload.get("market_context", {}).get("last_price")
             atr4 = (llm_payload.get("taapi") or {}).get("atr", {}).get("4h")
             llm_result = _validate_proposals(llm_result, dirn, ent_fallback, atr4)
+        except Exception:
+            pass
+        # Валидация и расчёт RR для сетки (grid)
+        try:
+            def rr_long(entry: float, tp: float, sl: float) -> float:
+                return abs(tp - entry) / max(1e-9, abs(entry - sl))
+
+            def rr_short(entry: float, tp: float, sl: float) -> float:
+                return abs(entry - tp) / max(1e-9, abs(sl - entry))
+
+            def validate_and_fix_grid(res: dict, direction: str, current_price: Optional[float], atr4: Optional[float], key_band: Optional[tuple[float, float]], hard_stop_value: Optional[float]):
+                g = res.get("grid") or {}
+                sl = g.get("hard_stop")
+                entries = g.get("entries") or []
+                mode = g.get("mode") or "single_tp"
+                tp_single = g.get("tp_single")
+                # enforce hard stop from setup
+                try:
+                    if hard_stop_value is not None:
+                        sl = float(hard_stop_value)
+                        g["hard_stop"] = sl
+                except Exception:
+                    pass
+                if sl is None:
+                    res["grid"] = g
+                    return res
+                if not isinstance(entries, list):
+                    entries = []
+                fixed = []
+                for e in entries:
+                    try:
+                        price = float(e.get("price"))
+                    except Exception:
+                        e["eligible"] = False
+                        e["rr"] = 0.0
+                        fixed.append(e)
+                        continue
+                    tp = e.get("tp")
+                    eligible = bool(e.get("eligible", True))
+                    if tp is None:
+                        eligible = False
+                    try:
+                        slf = float(sl)
+                        tpf = float(tp) if tp is not None else None
+                    except Exception:
+                        eligible = False
+                        tpf = None
+                    if direction == "long":
+                        if current_price is not None and price > float(current_price):
+                            eligible = False
+                        if not (tpf is not None and slf < price < tpf):
+                            eligible = False
+                        rr = rr_long(price, tpf if tpf is not None else price, slf) if eligible else 0.0
+                    else:
+                        if current_price is not None and price < float(current_price):
+                            eligible = False
+                        if not (tpf is not None and tpf < price < slf):
+                            eligible = False
+                        rr = rr_short(price, tpf if tpf is not None else price, slf) if eligible else 0.0
+                    if eligible and rr < 3.0:
+                        eligible = False
+                    e["eligible"] = eligible
+                    e["rr"] = round(rr, 2) if rr else 0.0
+                    fixed.append(e)
+                # ensure exactly 5 entries (pad if needed)
+                final_entries = list(fixed)
+                # choose step
+                step_px = None
+                if atr4:
+                    try:
+                        step_px = float(atr4) * 0.45
+                    except Exception:
+                        step_px = None
+                if step_px is None and key_band:
+                    try:
+                        band_min, band_max = float(key_band[0]), float(key_band[1])
+                        band_span = max(0.0, band_max - band_min)
+                        step_px = band_span / 4.0 if band_span > 0 else None
+                    except Exception:
+                        step_px = None
+                while len(final_entries) < 5 and current_price is not None:
+                    last_price = None
+                    if final_entries:
+                        try:
+                            last_price = float(final_entries[-1].get("price"))
+                        except Exception:
+                            last_price = None
+                    base_price = float(current_price) if last_price is None else last_price
+                    if step_px is None:
+                        # no ATR and no band -> cannot infer step, break
+                        break
+                    if direction == "long":
+                        price_new = base_price - step_px
+                    else:
+                        price_new = base_price + step_px
+                    tp_new = None
+                    if mode == "single_tp" and tp_single is not None:
+                        tp_new = tp_single
+                    elif atr4:
+                        tp_new = (price_new + 3.0 * float(atr4)) if direction == "long" else (price_new - 3.0 * float(atr4))
+                    eligible_new = True
+                    # band constraint
+                    if key_band:
+                        try:
+                            if not (float(key_band[0]) <= price_new <= float(key_band[1])):
+                                eligible_new = False
+                            # clamp into band softly
+                            price_new = max(float(key_band[0]), min(price_new, float(key_band[1])))
+                        except Exception:
+                            pass
+                    # direction validity and RR
+                    rr_new = 0.0
+                    try:
+                        if tp_new is None:
+                            eligible_new = False
+                        if direction == "long":
+                            if not (tp_new is not None and sl < price_new < tp_new):
+                                eligible_new = False
+                            rr_new = rr_long(price_new, float(tp_new) if tp_new is not None else price_new, float(sl)) if eligible_new else 0.0
+                        else:
+                            if not (tp_new is not None and tp_new < price_new < sl):
+                                eligible_new = False
+                            rr_new = rr_short(price_new, float(tp_new) if tp_new is not None else price_new, float(sl)) if eligible_new else 0.0
+                        if eligible_new and rr_new < 3.0:
+                            eligible_new = False
+                    except Exception:
+                        eligible_new = False
+                        rr_new = 0.0
+                    final_entries.append({
+                        "price": round(price_new, 6),
+                        "tp": round(float(tp_new), 6) if tp_new is not None else None,
+                        "eligible": bool(eligible_new),
+                        "rr": round(rr_new, 2) if rr_new else 0.0,
+                        "note": "auto-filled"
+                    })
+                # trim to 5
+                if len(final_entries) > 5:
+                    final_entries = final_entries[:5]
+                g["entries"] = final_entries
+                rr_vals = [e["rr"] for e in final_entries if e.get("eligible")]
+                blended = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else 0.0
+                g["blended_rr"] = blended
+                # compute average step in ATR units across final entries
+                if atr4 and len(final_entries) >= 2:
+                    steps = []
+                    for i in range(1, len(final_entries)):
+                        try:
+                            steps.append(abs(float(final_entries[i]["price"]) - float(final_entries[i-1]["price"])) / float(atr4))
+                        except Exception:
+                            pass
+                    g.setdefault("constraints", {})
+                    g["constraints"]["step_atr_4h"] = round(sum(steps)/len(steps), 2) if steps else None
+                if key_band:
+                    g.setdefault("constraints", {})
+                    g["constraints"]["used_key_level_band"] = [float(key_band[0]), float(key_band[1])]
+                res["grid"] = g
+                return res
+
+            dirn = (llm_payload.get("setup_parsed") or {}).get("direction") or ""
+            cp = (llm_payload.get("setup_parsed") or {}).get("current_price") or (llm_payload.get("market_context") or {}).get("last_price")
+            atr4 = (llm_payload.get("taapi") or {}).get("atr", {}).get("4h")
+            kv = (llm_payload.get("setup_parsed") or {}).get("key_levels") or {}
+            key_band = None
+            if kv and kv.get("min") is not None and kv.get("max") is not None:
+                key_band = (float(kv.get("min")), float(kv.get("max")))
+            sl_value = (llm_payload.get("setup_parsed") or {}).get("sl")
+            llm_result = validate_and_fix_grid(llm_result, dirn, cp, atr4, key_band, sl_value)
         except Exception:
             pass
 

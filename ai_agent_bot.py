@@ -35,7 +35,7 @@ except Exception:
 # Import pipeline and prompt after environment is loaded, so they see fresh env vars
 from cursor_pipeline import orchestrate_setup_flow, call_llm  # noqa: E402
 from llm_prompt import PROMPT  # noqa: E402
-from watcher import REG  # registry for watch
+from watcher import REG, WatchItem, _watch_loop  # registry and watch loop
 
 # Telegram credentials
 # Prefer environment variables, but fall back to values used elsewhere in the repo if present
@@ -56,14 +56,14 @@ SYSTEM_PROMPT = os.getenv(
 TAAPI_KEY = os.getenv("TAAPI_KEY", "")
 TAAPI_EXCHANGE = os.getenv("TAAPI_EXCHANGE", "binancefutures")
 
-# === Forward target (Telegram channel) ===
-FORWARD_TARGET_ID = int(os.getenv("FORWARD_TARGET_ID", "-1003249126475"))
-FORWARD_PREFIX = os.getenv("FORWARD_PREFIX", "[AUTO-FWD]")
-
-# === Watch policy ===
-WATCH_DEFAULT_HOURS = int(os.getenv("WATCH_DEFAULT_HOURS", "12"))
+# === Forward/Watch config ===
+FORWARD_TARGET_ID = int(os.getenv("FORWARD_TARGET_ID", "0"))
+FORWARD_PREFIX = os.getenv("FORWARD_PREFIX", "📡 AUTO")
+FORWARD_THRESHOLD = int(os.getenv("FORWARD_THRESHOLD", "70"))
+WATCH_THRESHOLD = int(os.getenv("WATCH_THRESHOLD", "70"))
+WATCH_WINDOW_HOURS = int(os.getenv("WATCH_WINDOW_HOURS", "12"))
 WATCH_INTERVAL_MIN = int(os.getenv("WATCH_INTERVAL_MIN", "60"))
-WATCH_ENTER_SCORE = float(os.getenv("WATCH_ENTER_SCORE", "70"))
+SHOW_DEBUG = os.getenv("SHOW_DEBUG", "0") == "1"
 
 
 logging.basicConfig(
@@ -209,6 +209,78 @@ def parse_setup_message(text: str) -> dict | None:
     if not any(v is not None for v in payload.values()):
         return None
     return payload
+
+
+# stable key for dedup (ticker+levels+direction+key_levels)
+import hashlib
+
+
+def setup_key(parsed: dict) -> str:
+    base = {
+        "ticker": parsed.get("ticker"),
+        "direction": parsed.get("direction"),
+        "tp": parsed.get("tp"),
+        "sl": parsed.get("sl"),
+        "kl": parsed.get("key_levels"),
+    }
+    s = json.dumps(base, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+async def forward_to_channel(tg: TelegramClient, parsed: dict, llm_result: dict) -> None:
+    if FORWARD_TARGET_ID == 0:
+        return
+    meta = parsed.get("_meta") or {}
+    src_chat = meta.get("src_chat_id")
+    src_msg = meta.get("src_msg_id")
+    head = f"{FORWARD_PREFIX} | {parsed.get('ticker')} {parsed.get('direction')} | score {llm_result.get('score')}"
+    try:
+        await tg.send_message(FORWARD_TARGET_ID, head)
+        if src_chat and src_msg:
+            await tg.forward_messages(FORWARD_TARGET_ID, src_msg, src_chat)
+        else:
+            raw = meta.get("raw_text") or "—"
+            await tg.send_message(FORWARD_TARGET_ID, raw)
+    except Exception:
+        logger.exception("forward_to_channel failed")
+
+
+async def maybe_forward_or_watch(tg: TelegramClient, parsed: dict, llm_result: dict) -> None:
+    try:
+        score = int(llm_result.get("score", 0))
+    except Exception:
+        score = 0
+    key = setup_key(parsed)
+    # prevent duplicates
+    try:
+        if REG.last_forwarded_keys.get(key):
+            return
+    except Exception:
+        pass
+    if score >= FORWARD_THRESHOLD:
+        await forward_to_channel(tg, parsed, llm_result)
+        try:
+            REG.last_forwarded_keys[key] = time.time()
+        except Exception:
+            pass
+        return
+    if 40 <= score < FORWARD_THRESHOLD:
+        # enqueue watch if not exists
+        try:
+            if key not in REG.watches:
+                now = time.time()
+                wi = WatchItem(
+                    key=key,
+                    payload={"parsed": parsed, "last_llm": llm_result},
+                    started_ts=now,
+                    deadline_ts=now + WATCH_WINDOW_HOURS * 3600,
+                    interval_sec=WATCH_INTERVAL_MIN * 60,
+                    threshold=WATCH_THRESHOLD,
+                )
+                REG.watches[key] = wi
+                asyncio.create_task(_watch_loop(tg, wi))
+        except Exception:
+            pass
 
 
 async def fetch_binance_price(symbol_usdt: str) -> float | None:
@@ -616,9 +688,10 @@ async def main() -> None:
                 # attach meta
                 try:
                     parsed["_meta"] = {
-                        "source_chat_id": event.chat_id,
-                        "source_msg_id": getattr(event, "message", None).id if getattr(event, "message", None) else None,
+                        "src_chat_id": event.chat_id,
+                        "src_msg_id": getattr(event, "message", None).id if getattr(event, "message", None) else None,
                         "raw_text": getattr(event, "message", None).raw_text if getattr(event, "message", None) else text,
+                        "ts_utc": None,
                     }
                     try:
                         REG.remember_last_parsed(event.chat_id, parsed)
@@ -627,12 +700,79 @@ async def main() -> None:
                 except Exception:
                     pass
                 try:
-                    preview, llm_payload, llm_result = await orchestrate_setup_flow(parsed, PROMPT, with_llm=True)
-                    await event.respond("📦 Payload preview:\n" + "```\n" + preview + "\n```")
+                    _preview, llm_payload, llm_result = await orchestrate_setup_flow(parsed, PROMPT, with_llm=True)
                     if llm_result:
-                        await event.respond("🤖 LLM result:\n" + json.dumps(llm_result, ensure_ascii=False, indent=2))
+                        try:
+                            # 1) Итог
+                            def render_conclusion(res: dict) -> str:
+                                c = res.get("conclusion") or {}
+                                head = c.get("headline") or "Итог недоступен"
+                                bullets = c.get("bullets") or []
+                                inv = c.get("invalidation") or ""
+                                lines = [f"🧾 *Итог:* {head}"]
+                                for b in bullets[:6]:
+                                    lines.append(f"• {b}")
+                                if inv:
+                                    lines.append(f"_Инвалидация:_ {inv}")
+                                return "\n".join(lines)
+
+                            concl_text = render_conclusion(llm_result)
+                            await tg.send_message(event.chat_id, concl_text, parse_mode="Markdown")
+
+                            # 2) Тактика
+                            def render_tactical(tc: dict | None) -> str:
+                                if not tc:
+                                    return ""
+                                lines = ["🎯 *Тактика:*", tc.get("summary", "—")]
+                                grid_levels = tc.get("grid_levels") if isinstance(tc, dict) else None
+                                if isinstance(grid_levels, list) and grid_levels:
+                                    lines.append("📐 *Сетка:* " + " / ".join(map(str, grid_levels)))
+                                adv = tc.get("advice")
+                                if isinstance(adv, list):
+                                    for a in adv[:5]:
+                                        lines.append(f"• {a}")
+                                return "\n".join(lines)
+
+                            tact = llm_result.get("tactical_comment") if isinstance(llm_result, dict) else None
+                            tact_text = render_tactical(tact)
+                            if tact_text:
+                                await tg.send_message(event.chat_id, tact_text, parse_mode="Markdown")
+
+                            # 3) Сетка
+                            g = llm_result.get("grid") if isinstance(llm_result, dict) else None
+                            if isinstance(g, dict):
+                                entries = g.get("entries") or []
+                                if isinstance(entries, list) and entries:
+                                    lines = ["🧱 *Сетка (RR≥3, SL фикс):*"]
+                                    for idx, e in enumerate(entries[:5], start=1):
+                                        price = e.get("price")
+                                        tpv = e.get("tp")
+                                        rr = e.get("rr")
+                                        ok = bool(e.get("eligible"))
+                                        mark = "✅" if ok else "✖️"
+                                        lines.append(f"{idx}) {price} → TP {tpv} (RR {rr}) {mark}")
+                                    blended = g.get("blended_rr")
+                                    sl_v = g.get("hard_stop")
+                                    cons = g.get("constraints") or {}
+                                    stepv = cons.get("step_atr_4h")
+                                    band = cons.get("used_key_level_band")
+                                    lines.append(f"Blended RR: {blended}")
+                                    tail = f"SL: {sl_v}"
+                                    if stepv is not None:
+                                        tail += f" | шаг ≈ {stepv}×ATR"
+                                    if isinstance(band, list) and len(band) == 2:
+                                        tail += f" | Band: {band[0]}–{band[1]}"
+                                    lines.append(tail)
+                                await tg.send_message(event.chat_id, "\n".join(lines), parse_mode="Markdown")
+                            # auto decision: forward or watch
+                            try:
+                                await maybe_forward_or_watch(tg, parsed, llm_result)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                     else:
-                        await event.respond("❕ LLM недоступен или ответ пуст. Payload отправлен без анализа.")
+                        await event.respond("❕ LLM недоступен или ответ пуст.")
                 except Exception:
                     # fallback: just show parsed
                     await event.respond("Parsed setup:\n" + json.dumps(parsed, ensure_ascii=False, indent=2))
