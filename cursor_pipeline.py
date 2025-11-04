@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, asyncio, random, math
 from typing import Any, Dict, Optional, Tuple
+import time
 from llm_prompt import PROMPT
 import json
 
@@ -9,6 +10,7 @@ import httpx
 # === CONFIG ===
 TAAPI_KEY = os.getenv("TAAPI_KEY", "")
 TAAPI_BASE = "https://api.taapi.io"
+TAAPI_EXCHANGE = os.getenv("TAAPI_EXCHANGE", "binancefutures")
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUT = "https://fapi.binance.com"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -132,7 +134,7 @@ async def taapi_get(client: httpx.AsyncClient, ind: str, symbol_slash: str, inte
     secret = _get_taapi_key()
     if not secret:
         return None
-    params = {"secret": secret, "exchange": "binance", "symbol": symbol_slash, "interval": interval}
+    params = {"secret": secret, "exchange": TAAPI_EXCHANGE, "symbol": symbol_slash, "interval": interval}
     if extra: params.update(extra)
     return await _aget_json(client, f"{TAAPI_BASE}/{ind}", params)
 
@@ -157,20 +159,22 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
         minusdi12 = asyncio.create_task(taapi_get(client, "minusdi", slash, "12h"))
         macd4  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}))
         macd12 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}))
+        macd4_bt1  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}))
+        macd12_bt1 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}))
         atr4   = asyncio.create_task(taapi_get(client, "atr",   slash, "4h"))
         atr12  = asyncio.create_task(taapi_get(client, "atr",   slash, "12h"))
         mfi4   = asyncio.create_task(taapi_get(client, "mfi",   slash, "4h"))
         bb4    = asyncio.create_task(taapi_get(client, "bbands",slash, "4h"))
         obv_now= asyncio.create_task(taapi_get(client, "obv",   slash, "4h"))
         obv_bt = asyncio.create_task(taapi_get(client, "obv",   slash, "4h", extra={"backtrack": 20}))
-        rsi12  = asyncio.create_task(taapi_get(client, "rsi",   slash, "12h"))
+        rsi12  = asyncio.create_task(taapi_get(client, "rsi",   slash, "12h", extra={"optInMAType": 1, "backtrack": 0, "close": 1}))
         ema200 = asyncio.create_task(taapi_get(client, "ema",   slash, "12h", extra={"period": 200}))
 
         # ждем
         adx4, adx12, dmi4, dmi12, macd4, macd12, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, ema200, \
-        plusdi4, minusdi4, plusdi12, minusdi12 = await asyncio.gather(
+        plusdi4, minusdi4, plusdi12, minusdi12, macd4_bt1, macd12_bt1 = await asyncio.gather(
             adx4, adx12, dmi4, dmi12, macd4, macd12, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, ema200,
-            plusdi4, minusdi4, plusdi12, minusdi12
+            plusdi4, minusdi4, plusdi12, minusdi12, macd4_bt1, macd12_bt1
         )
 
     # нормализация
@@ -229,6 +233,11 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
     atr = {"4h": _to_float(atr4.get("value") if atr4 else None), "12h": _to_float(atr12.get("value") if atr12 else None)}
     mfi = {"4h": _to_float(mfi4.get("value") if mfi4 else None)}
     bb_width = {"4h": map_bb_width(bb4)}
+    # extract bb levels for percent_b calculation later
+    bb_upper = (bb4 or {}).get("valueUpper") or (bb4 or {}).get("valueUpperBand") or (bb4 or {}).get("upper")
+    bb_lower = (bb4 or {}).get("valueLower") or (bb4 or {}).get("valueLowerBand") or (bb4 or {}).get("lower")
+    bb_middle = (bb4 or {}).get("valueMiddle") or (bb4 or {}).get("valueMiddleBand") or (bb4 or {}).get("middle") or (bb4 or {}).get("basis")
+    bb_upper = _to_float(bb_upper); bb_lower = _to_float(bb_lower); bb_middle = _to_float(bb_middle)
 
     # obv_trend
     now_v = _to_float((obv_now or {}).get("value"))
@@ -238,18 +247,34 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
         pct = (now_v - bt_v) / abs(bt_v)
         obv_trend = "up" if pct > 0.02 else ("down" if pct < -0.02 else "flat")
 
+    # capture optional TAAPI timestamps for RSI to verify closed candle
+    def _ts(d: dict | None) -> Optional[int]:
+        if not d:
+            return None
+        for k in ("timestamp", "time", "unix"):
+            v = d.get(k)
+            try:
+                if v is not None:
+                    return int(v)
+            except Exception:
+                continue
+        return None
+
     filters = {
         "ema200_12h": _to_float((ema200 or {}).get("value")),
         "rsi_12h": _to_float((rsi12 or {}).get("value")),
+        "rsi_12h_ts": _ts(rsi12),
     }
 
     return {
         "adx": adx,
         "dmi": dmi,
         "macd": macd,
+        "macd_prev": {"4h": {"hist": (map_macd(macd4_bt1) or {}).get("hist")}, "12h": {"hist": (map_macd(macd12_bt1) or {}).get("hist")}},
         "atr": atr,
         "mfi": mfi,
         "bb_width": bb_width,
+        "bb": {"4h": {"upper": bb_upper, "lower": bb_lower, "middle": bb_middle}},
         "obv": {"4h_trend": obv_trend},
         "filters": filters,
     }
@@ -329,6 +354,23 @@ def build_llm_payload(parsed: dict, taapi_bundle: dict, last_price: Optional[flo
             "key_levels": parsed.get("key_levels"),
             "levels_invalid": levels_invalid
         },
+        "derived": {
+            "dmi_spread_4h": (abs((taapi_bundle.get("dmi") or {}).get("4h", {}).get("di_plus") - (taapi_bundle.get("dmi") or {}).get("4h", {}).get("di_minus"))
+                               if (taapi_bundle.get("dmi") or {}).get("4h") and (taapi_bundle.get("dmi") or {}).get("4h", {}).get("di_plus") is not None and (taapi_bundle.get("dmi") or {}).get("4h", {}).get("di_minus") is not None else None),
+            "dmi_spread_12h": (abs((taapi_bundle.get("dmi") or {}).get("12h", {}).get("di_plus") - (taapi_bundle.get("dmi") or {}).get("12h", {}).get("di_minus"))
+                                if (taapi_bundle.get("dmi") or {}).get("12h") and (taapi_bundle.get("dmi") or {}).get("12h", {}).get("di_plus") is not None and (taapi_bundle.get("dmi") or {}).get("12h", {}).get("di_minus") is not None else None),
+            "macd_hist_4h_slope": ( ((taapi_bundle.get("macd") or {}).get("4h", {}).get("hist") or 0) - (((taapi_bundle.get("macd_prev") or {}).get("4h", {}) or {}).get("hist") or 0) ) if (taapi_bundle.get("macd") or {}).get("4h") else None,
+            "macd_hist_12h_slope": ( ((taapi_bundle.get("macd") or {}).get("12h", {}).get("hist") or 0) - (((taapi_bundle.get("macd_prev") or {}).get("12h", {}) or {}).get("hist") or 0) ) if (taapi_bundle.get("macd") or {}).get("12h") else None,
+            "rsi12h_distance_50": (abs(((taapi_bundle.get("filters") or {}).get("rsi_12h") or 0) - 50) if (taapi_bundle.get("filters") or {}).get("rsi_12h") is not None else None),
+            "percent_b_4h": ( ((cp if cp is not None else last_price) - ( (taapi_bundle.get("bb") or {}).get("4h", {}).get("lower") or 0 )) / (((taapi_bundle.get("bb") or {}).get("4h", {}).get("upper") or 0) - ((taapi_bundle.get("bb") or {}).get("4h", {}).get("lower") or 0))
+                               if (taapi_bundle.get("bb") or {}).get("4h") and (taapi_bundle.get("bb") or {}).get("4h", {}).get("upper") not in (None, 0) and (taapi_bundle.get("bb") or {}).get("4h", {}).get("lower") is not None and ((taapi_bundle.get("bb") or {}).get("4h", {}).get("upper") - (taapi_bundle.get("bb") or {}).get("4h", {}).get("lower")) not in (None, 0) and (cp is not None or last_price is not None) else None),
+            "atr_ratios": {
+                "entry_px_ratio": (abs(((cp if cp is not None else 0) - (cp if cp is not None else 0)))/((taapi_bundle.get("atr") or {}).get("4h") or 1.0)) if (cp is not None and (taapi_bundle.get("atr") or {}).get("4h") not in (None, 0)) else None,
+                "sl_entry_ratio": (abs(((sl or 0) - (cp or 0)))/((taapi_bundle.get("atr") or {}).get("4h") or 1.0)) if (sl is not None and cp is not None and (taapi_bundle.get("atr") or {}).get("4h") not in (None, 0)) else None,
+                "tp_entry_ratio": (abs(((tp or 0) - (cp or 0)))/((taapi_bundle.get("atr") or {}).get("4h") or 1.0)) if (tp is not None and cp is not None and (taapi_bundle.get("atr") or {}).get("4h") not in (None, 0)) else None,
+            },
+            "staleness_hours": ((time.time() - float((taapi_bundle.get("filters") or {}).get("rsi_12h_ts") or 0)) / 3600.0) if ((taapi_bundle.get("filters") or {}).get("rsi_12h_ts") is not None) else None,
+        },
         "taapi": {
             "adx": taapi_bundle.get("adx"),
             "dmi": taapi_bundle.get("dmi"),
@@ -393,7 +435,7 @@ def make_human_preview(payload: dict) -> str:
 
 # ========== опционально: вызов LLM ==========
 
-EXPECTED_KEYS = {"symbol", "direction", "verdict", "score", "flags", "corrections", "rationale_short"}
+EXPECTED_KEYS = {"symbol", "direction", "verdict", "score", "flags", "corrections", "rationale_short", "confidence", "subscores", "debug"}
 
 def _valid_llm(d: dict) -> bool:
     return isinstance(d, dict) and EXPECTED_KEYS.issubset(set(d.keys()))
@@ -484,6 +526,85 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
         payload_for_llm = dict(llm_payload)
         payload_for_llm["_echo_guard"] = "DO_NOT_RETURN"
         llm_result = await call_llm(payload_for_llm)
+        # если пришли subscores — считаем итоговый score в коде
+        try:
+            WEIGHTS = {
+                "trend_align":0.15, "dmi_spread":0.10, "adx_strength":0.15, "macd_momentum":0.15,
+                "rsi_state":0.10, "vol_regime":0.10, "obv_flow":0.05, "levels_quality":0.10,
+                "market_ctx":0.07, "staleness":0.03
+            }
+            if isinstance(llm_result, dict) and isinstance(llm_result.get("subscores"), dict):
+                sub = llm_result["subscores"]
+                base = 0.0
+                for k, w in WEIGHTS.items():
+                    try:
+                        base += w * float(sub.get(k, 0) or 0)
+                    except Exception:
+                        pass
+                score = int(round(base))
+                flags = llm_result.get("flags") or []
+                if isinstance(flags, list):
+                    if "counter_trend" in flags:
+                        score -= 7
+                    if "adx_low" in flags:
+                        score -= 5
+                score = max(0, min(100, score))
+                llm_result["score"] = score
+                llm_result["confidence"] = max(1, min(10, int(round(score/10))))
+        except Exception:
+            pass
+        # Нормализация confidence и confidence_text в любом случае
+        try:
+            if isinstance(llm_result, dict) and isinstance(llm_result.get("score"), (int, float)):
+                _conf = int(max(1, min(10, round(float(llm_result.get("score")) / 10))))
+                llm_result["confidence"] = _conf
+                llm_result["confidence_text"] = f"{_conf*10}% уверенности"
+        except Exception:
+            pass
+        # Валидация предложений уровней (proposals)
+        try:
+            def _validate_proposals(res: dict, direction: str, entry_val: Optional[float], atr4: Optional[float]) -> dict:
+                if not isinstance(res, dict):
+                    return res
+                proposals = res.get("proposals") or []
+                if not isinstance(proposals, list):
+                    res["proposals"] = []
+                    return res
+                ok = []
+                ent0 = entry_val
+                for p in proposals:
+                    try:
+                        ent = ent0
+                        if p.get("entry") not in (None, "use_current"):
+                            ent = float(p.get("entry"))
+                        sl = float(p["sl"]) if p.get("sl") is not None else None
+                        tp = float(p["tp"]) if p.get("tp") is not None else None
+                        if ent is None or sl is None or tp is None:
+                            continue
+                        if direction == "long" and not (sl < ent < tp):
+                            continue
+                        if direction == "short" and not (tp < ent < sl):
+                            continue
+                        rr = abs(tp - ent) / max(1e-9, abs(ent - sl))
+                        if rr < 1.5:
+                            continue
+                        if atr4:
+                            dist_sl_atr = abs(ent - sl) / atr4
+                            if not (0.5 <= dist_sl_atr <= 2.5):
+                                continue
+                        p["rr"] = round(rr, 2)
+                        ok.append(p)
+                    except Exception:
+                        continue
+                res["proposals"] = ok[:3]
+                return res
+
+            dirn = (llm_result or {}).get("direction") or llm_payload.get("setup_parsed", {}).get("direction")
+            ent_fallback = llm_payload.get("setup_parsed", {}).get("current_price") or llm_payload.get("market_context", {}).get("last_price")
+            atr4 = (llm_payload.get("taapi") or {}).get("atr", {}).get("4h")
+            llm_result = _validate_proposals(llm_result, dirn, ent_fallback, atr4)
+        except Exception:
+            pass
 
     return preview, llm_payload, llm_result
 

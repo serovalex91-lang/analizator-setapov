@@ -54,6 +54,7 @@ SYSTEM_PROMPT = os.getenv(
     ),
 )
 TAAPI_KEY = os.getenv("TAAPI_KEY", "")
+TAAPI_EXCHANGE = os.getenv("TAAPI_EXCHANGE", "binancefutures")
 
 # === Forward target (Telegram channel) ===
 FORWARD_TARGET_ID = int(os.getenv("FORWARD_TARGET_ID", "-1003249126475"))
@@ -242,8 +243,8 @@ async def fetch_taapi_adx(symbol_usdt: str) -> dict | None:
         async with httpx.AsyncClient(timeout=12.0) as client:
             u4 = "https://api.taapi.io/adx"
             u12 = "https://api.taapi.io/adx"
-            p4 = {"secret": TAAPI_KEY, "exchange": "binance", "symbol": ta_sym, "interval": "4h"}
-            p12 = {"secret": TAAPI_KEY, "exchange": "binance", "symbol": ta_sym, "interval": "12h"}
+            p4 = {"secret": TAAPI_KEY, "exchange": TAAPI_EXCHANGE, "symbol": ta_sym, "interval": "4h"}
+            p12 = {"secret": TAAPI_KEY, "exchange": TAAPI_EXCHANGE, "symbol": ta_sym, "interval": "12h"}
             r4, r12 = await asyncio.gather(client.get(u4, params=p4), client.get(u12, params=p12))
             if r4.status_code != 200 or r12.status_code != 200:
                 return None
@@ -282,7 +283,7 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict | None:
         except Exception:
             return None
 
-    p4 = {"secret": TAAPI_KEY, "exchange": "binance", "symbol": ta_sym, "interval": "4h"}
+    p4 = {"secret": TAAPI_KEY, "exchange": TAAPI_EXCHANGE, "symbol": ta_sym, "interval": "4h"}
     p12 = {**p4, "interval": "12h"}
 
     adx4, adx12 = await asyncio.gather(
