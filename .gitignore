@@ -1,17 +1,27 @@
-﻿venv/
+﻿# Windows noise
+Thumbs.db
+Desktop.ini
+.BIN/
+System Volume Information/
+
+# Python
 __pycache__/
 *.pyc
+.env
+.venv/
 *.log
-*.session
-levels.db
-intraday-levels-taapi/.env
-raw_messages.log
-messages.log
-\.env
-ai.env
-*.env
-*.session-journal
-*.db
-db.dump/
-*.tgz
-*.7z
+
+# Node/Yarn (на всякий)
+node_modules/
+
+# Editors/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Cursor / Telethon / токены
+.cursor/
+ai_bot_session.session
+
+# Docker
+.docker/
