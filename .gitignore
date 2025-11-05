@@ -7,3 +7,11 @@ levels.db
 intraday-levels-taapi/.env
 raw_messages.log
 messages.log
+\.env
+ai.env
+*.env
+*.session-journal
+*.db
+db.dump/
+*.tgz
+*.7z
