@@ -6,6 +6,7 @@ from llm_prompt import PROMPT
 import json
 
 import httpx
+import logging
 
 # === CONFIG ===
 TAAPI_KEY = os.getenv("TAAPI_KEY", "")
@@ -23,6 +24,7 @@ RETRIES = 3
 
 TF_BALLS = ["30m", "60m", "120m", "240m", "720m"]
 
+logger = logging.getLogger("cursor_pipeline")
 
 # ========== низкоуровневые утилиты ==========
 
@@ -533,6 +535,11 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
         payload_for_llm = dict(llm_payload)
         payload_for_llm["_echo_guard"] = "DO_NOT_RETURN"
         llm_result = await call_llm(payload_for_llm)
+        try:
+            if isinstance(llm_result, dict):
+                logger.info("[PIPE] got llm_result keys: %s", list(llm_result.keys()))
+        except Exception:
+            pass
         # если пришли subscores — считаем итоговый score в коде
         try:
             WEIGHTS = {

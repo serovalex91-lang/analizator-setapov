@@ -233,6 +233,8 @@ async def forward_to_channel(tg: TelegramClient, parsed: dict, llm_result: dict)
     meta = parsed.get("_meta") or {}
     src_chat = meta.get("src_chat_id")
     src_msg = meta.get("src_msg_id")
+    key = setup_key(parsed)
+    logger.info("forward_to_channel: to=%s key=%s", FORWARD_TARGET_ID, key)
     head = f"{FORWARD_PREFIX} | {parsed.get('ticker')} {parsed.get('direction')} | score {llm_result.get('score')}"
     try:
         await tg.send_message(FORWARD_TARGET_ID, head)
