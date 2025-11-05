@@ -513,6 +513,14 @@ async def main() -> None:
     await tg.start(bot_token=TELEGRAM_BOT_TOKEN)
 
     logger.info("AI Telegram bot started. Waiting for messages…")
+    # Log effective config once
+    try:
+        logger.info(
+            "CFG: FORWARD_THRESHOLD=%s WATCH_THRESHOLD=%s WATCH_WINDOW_HOURS=%s WATCH_INTERVAL_MIN=%s FORWARD_TARGET_ID=%s",
+            FORWARD_THRESHOLD, WATCH_THRESHOLD, WATCH_WINDOW_HOURS, WATCH_INTERVAL_MIN, FORWARD_TARGET_ID,
+        )
+    except Exception:
+        pass
 
     @tg.on(events.NewMessage(pattern=r"^/start(?:@.*)?$"))
     async def _(event):  # noqa: ANN001
@@ -723,6 +731,19 @@ async def main() -> None:
                 try:
                     _preview, llm_payload, llm_result = await orchestrate_setup_flow(parsed, PROMPT, with_llm=True)
                     if llm_result:
+                        # decision log and trigger
+                        try:
+                            sc = llm_result.get("score") if isinstance(llm_result, dict) else None
+                            logger.info(
+                                "Decision: incoming score=%s (fwd>=%s, watch range %s..%s, window=%sh, step=%smin)",
+                                sc, FORWARD_THRESHOLD, WATCH_THRESHOLD, FORWARD_THRESHOLD - 1, WATCH_WINDOW_HOURS, WATCH_INTERVAL_MIN,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await maybe_forward_or_watch(tg, parsed, llm_result)
+                        except Exception:
+                            pass
                         try:
                             # 1) Итог
                             def render_conclusion(res: dict) -> str:
@@ -785,11 +806,6 @@ async def main() -> None:
                                         tail += f" | Band: {band[0]}–{band[1]}"
                                     lines.append(tail)
                                 await tg.send_message(event.chat_id, "\n".join(lines), parse_mode="Markdown")
-                            # auto decision: forward or watch
-                            try:
-                                await maybe_forward_or_watch(tg, parsed, llm_result)
-                            except Exception:
-                                pass
                         except Exception:
                             pass
                     else:
