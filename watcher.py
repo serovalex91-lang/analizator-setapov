@@ -3,6 +3,7 @@ import os
 import asyncio
 import time
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, Optional
 
 # === Forward target (Telegram channel) ===
@@ -71,8 +72,11 @@ REG = _Registry()
 async def _watch_loop(tg, wi: WatchItem) -> None:
     from cursor_pipeline import orchestrate_setup_flow  # lazy import to avoid cycles
     from llm_prompt import PROMPT
+    logger = logging.getLogger("watcher")
+    logger.info("WATCH started: key=%s", wi.key)
     while True:
         if time.time() >= wi.deadline_ts:
+            logger.info("WATCH deadline reached: key=%s", wi.key)
             try:
                 src_chat = wi.payload["parsed"].get("_meta", {}).get("src_chat_id")
                 if src_chat:
@@ -86,7 +90,9 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             preview, llm_payload, llm_res = await orchestrate_setup_flow(parsed, PROMPT, with_llm=True)
             sc = int(llm_res.get("score", 0)) if isinstance(llm_res, dict) else 0
             wi.last_score = sc
+            logger.info("WATCH tick: key=%s last_score=%s threshold=%s", wi.key, wi.last_score, wi.threshold)
             if sc >= wi.threshold:
+                logger.info("WATCH promote to FORWARD: key=%s score=%s", wi.key, wi.last_score)
                 try:
                     from ai_agent_bot import forward_to_channel
                     await forward_to_channel(tg, parsed, llm_res)
@@ -97,5 +103,5 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                 REG.watches.pop(wi.key, None)
                 return
         except Exception:
-            pass
+            logger.exception("WATCH tick error: key=%s", wi.key)
         await asyncio.sleep(wi.interval_sec)

@@ -576,6 +576,25 @@ async def main() -> None:
             res = None
         await event.respond("LLM TEST RESULT:\n" + (json.dumps(res, ensure_ascii=False, indent=2) if res else "None"))
 
+    @tg.on(events.NewMessage(pattern=r"^/watch_status(?:@.*)?$"))
+    async def _watch_status(event):  # noqa: ANN001
+        try:
+            lines = []
+            for k, wi in (REG.watches or {}).items():
+                try:
+                    left = int((wi.deadline_ts or 0) - time.time())
+                    lines.append(
+                        f"• {k[:6]}… score={wi.last_score} next≈{(wi.interval_sec or 0)//60}m left={left//60}m thr={wi.threshold}"
+                    )
+                except Exception:
+                    continue
+            if not lines:
+                await event.respond("Нет активных наблюдений.")
+            else:
+                await event.respond("Наблюдения:\n" + "\n".join(lines))
+        except Exception:
+            await event.respond("Нет активных наблюдений.")
+
     @tg.on(events.NewMessage(pattern=r"^/watch(?:@.*)?(?:\s+(\d+))?(?:\s+(\d+))?(?:\s+(\d+(?:\.\d+)?))?$"))
     async def _watch(event):  # noqa: ANN001
         try:
