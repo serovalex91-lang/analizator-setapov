@@ -251,9 +251,17 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             preview, llm_payload, llm_res = await orchestrate_setup_flow(
                 parsed, PROMPT, with_llm=use_llm, history_data=hist, skip_heavy_tf=skip_heavy, volume_context=vol_ctx
             )
-            sc = int(llm_res.get("score", 0)) if (use_llm and isinstance(llm_res, dict)) else (wi.last_score or 0)
-            wi.last_score = sc
-            logger.info("WATCH tick: key=%s last_score=%s threshold=%s", wi.key, wi.last_score, wi.threshold)
+            # Update score only when LLM actually ran; otherwise keep previous value (may be None initially)
+            sc: Optional[int] = wi.last_score
+            if use_llm and isinstance(llm_res, dict):
+                try:
+                    val = llm_res.get("score")
+                    if isinstance(val, (int, float)):
+                        sc = int(val)
+                        wi.last_score = sc
+                except Exception:
+                    pass
+            logger.info("WATCH tick: key=%s last_score=%s threshold=%s", wi.key, (wi.last_score if wi.last_score is not None else "n/a"), wi.threshold)
             # act-based alerts from LLM (phase-aware)
             try:
                 act = (llm_res or {}).get("action") or {}
@@ -288,7 +296,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             # score-based cancel hint
             try:
                 cancel_score = int(os.getenv("CANCEL_SCORE", "35"))
-                if (wi.last_score or 0) <= cancel_score and _should_alert("score_low"):
+                if wi.last_score is not None and wi.last_score <= cancel_score and _should_alert("score_low"):
                     src_chat = parsed.get("_meta", {}).get("src_chat_id")
                     if src_chat:
                         await tg.send_message(src_chat, f"⚠️ {symbol}: score упал до {wi.last_score}/100 — идею лучше ОТМЕНИТЬ.")
@@ -318,7 +326,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             # block entry on opposite volume spike (pre_entry only)
             try:
                 block_by_volume = False
-                if wi.phase == "pre_entry" and (vol_ctx or {}).get("spike"):
+                if wi.phase == "pre_entry" and (vol_ctx or {}).get("spike") and wi.last_score is not None:
                     if direction == "short" and (vol_ctx or {}).get("dir") == "up":
                         block_by_volume = True
                     if direction == "long" and (vol_ctx or {}).get("dir") == "down":
