@@ -1,8 +1,8 @@
 import os
 
 
-WEBHOOK_URL = os.environ.get("SIGNAL_WEBHOOK_URL", "https://hook.finandy.com/zyzulAJkwB1Gag7trlUK").strip()
-WEBHOOK_SECRET = os.environ.get("SIGNAL_WEBHOOK_SECRET", "aa7wohs1xkt").strip()
+WEBHOOK_URL = os.environ.get("SIGNAL_WEBHOOK_URL", "").strip()
+WEBHOOK_SECRET = os.environ.get("SIGNAL_WEBHOOK_SECRET", "").strip()
 
 # Имя вебхука (SHORT)
 HOOK_NAME = os.environ.get("SIGNAL_HOOK_NAME", "шорт трейдерсетап").strip()
@@ -30,8 +30,8 @@ APPEND_USDT = os.environ.get("SIGNAL_APPEND_USDT", "1").strip() == "1"
 
 
 # Настройки для LONG вебхука (новые)
-LONG_WEBHOOK_URL = os.environ.get("SIGNAL_LONG_WEBHOOK_URL", "https://hook.finandy.com/8LPIa2NBMCdt7ObvrlUK").strip()
-LONG_WEBHOOK_SECRET = os.environ.get("SIGNAL_LONG_WEBHOOK_SECRET", "ucpxgbtqwi").strip()
+LONG_WEBHOOK_URL = os.environ.get("SIGNAL_LONG_WEBHOOK_URL", "").strip()
+LONG_WEBHOOK_SECRET = os.environ.get("SIGNAL_LONG_WEBHOOK_SECRET", "").strip()
 # Имя вебхука (LONG)
 LONG_HOOK_NAME = os.environ.get("SIGNAL_LONG_HOOK_NAME", "лонг трейдерсетап").strip()
 
@@ -45,5 +45,12 @@ QTY_ORDERS_DEFAULT = int(os.environ.get("SIGNAL_QTY_ORDERS_DEFAULT", "20").strip
 def set_dry_run(val: bool):
     global DRY_RUN
     DRY_RUN = bool(val)
+
+# Validate required webhook envs at import time to avoid leaking real defaults
+if not WEBHOOK_URL or not WEBHOOK_SECRET or not LONG_WEBHOOK_URL or not LONG_WEBHOOK_SECRET:
+    raise RuntimeError(
+        "Signal webhook config is not set. Please define SIGNAL_WEBHOOK_URL, SIGNAL_WEBHOOK_SECRET, "
+        "SIGNAL_LONG_WEBHOOK_URL and SIGNAL_LONG_WEBHOOK_SECRET in environment/.env"
+    )
 
 

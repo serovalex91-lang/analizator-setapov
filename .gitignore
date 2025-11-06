@@ -25,3 +25,8 @@ ai_bot_session.session
 
 # Docker
 .docker/
+
+ai.env
+NUL
+--exclude=venv
+

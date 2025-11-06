@@ -26,6 +26,70 @@ TF_BALLS = ["30m", "60m", "120m", "240m", "720m"]
 
 logger = logging.getLogger("cursor_pipeline")
 
+# ===== Simple in-memory cache for TAAPI calls =====
+_TAAPI_CACHE: dict[tuple[str, str, str, str], dict] = {}
+_TAAPI_TTL_SEC = int(os.getenv("TAAPI_CACHE_TTL", "300"))  # 5 minutes default
+_cache_hits = 0
+_cache_misses = 0
+
+def _rough_rr(direction: str, entry: float | None, sl: float | None, tp: float | None) -> float | None:
+    try:
+        if None in (entry, sl, tp):
+            return None
+        if direction == "long" and not (sl < entry < tp):
+            return None
+        if direction == "short" and not (tp < entry < sl):
+            return None
+        num = abs(tp - entry)
+        den = max(1e-9, abs(entry - sl))
+        return float(num / den)
+    except Exception:
+        return None
+
+def compute_fallback_score(llm_payload: dict) -> int:
+    """Дешёвый детерминированный скор 0..100 на базе тренда, ADX, MACD, RSI и RR."""
+    sp = (llm_payload.get("setup_parsed") or {})
+    ta = (llm_payload.get("taapi") or {})
+    dirn = (sp.get("direction") or "")
+    cp = sp.get("current_price")
+    sl = sp.get("sl"); tp = sp.get("tp")
+    rr = _rough_rr(dirn, cp, sl, tp) or 0.0
+    tb = sp.get("trend_balls") or []
+    trend_ok = 0.0
+    if dirn == "short":
+        trend_ok = (tb.count("down") / max(1, len(tb)))
+    elif dirn == "long":
+        trend_ok = (tb.count("up") / max(1, len(tb)))
+    adx4 = ((ta.get("adx") or {}).get("4h") or 0) or 0
+    adx12 = ((ta.get("adx") or {}).get("12h") or 0) or 0
+    macd4 = ((ta.get("macd") or {}).get("4h") or {}).get("hist")
+    macd12 = ((ta.get("macd") or {}).get("12h") or {}).get("hist")
+    rsi12 = ((ta.get("filters") or {}).get("rsi_12h"))
+    w_trend, w_rr, w_adx, w_macd, w_rsi = 0.25, 0.25, 0.2, 0.2, 0.1
+    s_trend = 100.0 * float(trend_ok)
+    s_rr = 100.0 * min(1.0, max(0.0, (rr - 1.0) / 3.0))
+    s_adx = 100.0 * min(1.0, max(0.0, (max(adx4 or 0, adx12 or 0) - 15) / 20))
+    s_macd = 50.0
+    try:
+        if macd4 is not None and macd12 is not None:
+            if dirn == "short":
+                s_macd = 75.0 if (macd4 < 0 and macd12 <= 0) else 35.0
+            else:
+                s_macd = 75.0 if (macd4 > 0 and macd12 >= 0) else 35.0
+    except Exception:
+        pass
+    s_rsi = 50.0
+    try:
+        if rsi12 is not None:
+            if dirn == "short":
+                s_rsi = 75.0 if rsi12 < 50 else 35.0
+            else:
+                s_rsi = 75.0 if rsi12 > 50 else 35.0
+    except Exception:
+        pass
+    base = w_trend*s_trend + w_rr*s_rr + w_adx*s_adx + w_macd*s_macd + w_rsi*s_rsi
+    return int(max(0, min(100, round(base))))
+
 # ========== низкоуровневые утилиты ==========
 
 async def _aget_json(client: httpx.AsyncClient, url: str, params: dict, retries: int = RETRIES) -> dict | None:
@@ -131,16 +195,48 @@ def compute_levels_invalid(direction: str, current_price: Optional[float], tp: O
 def _get_taapi_key() -> str:
     return os.getenv("TAAPI_KEY", "")
 
-async def taapi_get(client: httpx.AsyncClient, ind: str, symbol_slash: str, interval: str, extra: dict | None = None) -> dict | None:
-    # TAAPI чаще любит символ формата BTC/USDT
+async def taapi_get(
+    client: httpx.AsyncClient,
+    ind: str,
+    symbol_slash: str,
+    interval: str,
+    extra: dict | None = None,
+    use_cache_only: bool = False,
+) -> dict | None:
+    """Fetch TAAPI indicator with simple TTL cache.
+    If use_cache_only=True, return cached value or None (no network).
+    """
     secret = _get_taapi_key()
     if not secret:
         return None
     params = {"secret": secret, "exchange": TAAPI_EXCHANGE, "symbol": symbol_slash, "interval": interval}
-    if extra: params.update(extra)
-    return await _aget_json(client, f"{TAAPI_BASE}/{ind}", params)
+    if extra:
+        params.update(extra)
 
-async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
+    # cache key (indicator + symbol + interval)
+    try:
+        key = (ind, symbol_slash, interval, str(sorted(params.items())))
+        rec = _TAAPI_CACHE.get(key)
+        now = time.time()
+        if rec and (now - rec.get("ts", 0)) < _TAAPI_TTL_SEC:
+            globals()["_cache_hits"] += 1
+            return rec.get("data")
+        if use_cache_only:
+            return None
+        globals()["_cache_misses"] += 1
+    except Exception:
+        pass
+
+    data = await _aget_json(client, f"{TAAPI_BASE}/{ind}", params)
+    try:
+        _TAAPI_CACHE[key] = {"ts": time.time(), "data": data}
+        if (_cache_hits + _cache_misses) % 50 == 0:
+            logger.info("[TAAPI_CACHE] size=%s hits=%s misses=%s", len(_TAAPI_CACHE), _cache_hits, _cache_misses)
+    except Exception:
+        pass
+    return data
+
+async def fetch_taapi_bundle(symbol_usdt: str, skip_heavy_tf: bool = False) -> dict:
     # параллельные запросы (4h/12h)
     base = symbol_usdt.upper()
     # для TAAPI используем BTC/USDT
@@ -150,33 +246,30 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
         slash = base
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        adx4   = asyncio.create_task(taapi_get(client, "adx",   slash, "4h"))
-        adx12  = asyncio.create_task(taapi_get(client, "adx",   slash, "12h"))
-        dmi4   = asyncio.create_task(taapi_get(client, "dmi",   slash, "4h"))
-        dmi12  = asyncio.create_task(taapi_get(client, "dmi",   slash, "12h"))
-        # фолбэк на отдельные DI эндпоинты
-        plusdi4   = asyncio.create_task(taapi_get(client, "plusdi",  slash, "4h"))
-        minusdi4  = asyncio.create_task(taapi_get(client, "minusdi", slash, "4h"))
-        plusdi12  = asyncio.create_task(taapi_get(client, "plusdi",  slash, "12h"))
-        minusdi12 = asyncio.create_task(taapi_get(client, "minusdi", slash, "12h"))
-        macd4  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}))
-        macd12 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}))
-        macd4_bt1  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}))
-        macd12_bt1 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}))
-        atr4   = asyncio.create_task(taapi_get(client, "atr",   slash, "4h"))
-        atr12  = asyncio.create_task(taapi_get(client, "atr",   slash, "12h"))
-        mfi4   = asyncio.create_task(taapi_get(client, "mfi",   slash, "4h"))
-        bb4    = asyncio.create_task(taapi_get(client, "bbands",slash, "4h"))
-        obv_now= asyncio.create_task(taapi_get(client, "obv",   slash, "4h"))
-        obv_bt = asyncio.create_task(taapi_get(client, "obv",   slash, "4h", extra={"backtrack": 20}))
-        rsi12  = asyncio.create_task(taapi_get(client, "rsi",   slash, "12h", extra={"optInMAType": 1, "backtrack": 0, "close": 1}))
-        ema200 = asyncio.create_task(taapi_get(client, "ema",   slash, "12h", extra={"period": 200}))
+        # use_cache_only for heavy TF when skip_heavy_tf is True
+        uco = skip_heavy_tf
+        adx4   = asyncio.create_task(taapi_get(client, "adx",   slash, "4h",  use_cache_only=uco))
+        adx12  = asyncio.create_task(taapi_get(client, "adx",   slash, "12h", use_cache_only=uco))
+        dmi4   = asyncio.create_task(taapi_get(client, "dmi",   slash, "4h",  use_cache_only=uco))
+        dmi12  = asyncio.create_task(taapi_get(client, "dmi",   slash, "12h", use_cache_only=uco))
+        macd4  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}, use_cache_only=uco))
+        macd12 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}, use_cache_only=uco))
+        macd4_bt1  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}, use_cache_only=uco))
+        macd12_bt1 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}, use_cache_only=uco))
+        atr4   = asyncio.create_task(taapi_get(client, "atr",   slash, "4h",  use_cache_only=uco))
+        atr12  = asyncio.create_task(taapi_get(client, "atr",   slash, "12h", use_cache_only=uco))
+        mfi4   = asyncio.create_task(taapi_get(client, "mfi",   slash, "4h",  use_cache_only=False))
+        bb4    = asyncio.create_task(taapi_get(client, "bbands",slash, "4h",  use_cache_only=False))
+        obv_now= asyncio.create_task(taapi_get(client, "obv",   slash, "4h",  use_cache_only=False))
+        obv_bt = asyncio.create_task(taapi_get(client, "obv",   slash, "4h", extra={"backtrack": 20}, use_cache_only=False))
+        rsi12  = asyncio.create_task(taapi_get(client, "rsi",   slash, "12h", extra={"optInMAType": 1, "backtrack": 0, "close": 1}, use_cache_only=uco))
+        ema200 = asyncio.create_task(taapi_get(client, "ema",   slash, "12h", extra={"period": 200}, use_cache_only=uco))
 
         # ждем
         adx4, adx12, dmi4, dmi12, macd4, macd12, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, ema200, \
-        plusdi4, minusdi4, plusdi12, minusdi12, macd4_bt1, macd12_bt1 = await asyncio.gather(
+        macd4_bt1, macd12_bt1 = await asyncio.gather(
             adx4, adx12, dmi4, dmi12, macd4, macd12, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, ema200,
-            plusdi4, minusdi4, plusdi12, minusdi12, macd4_bt1, macd12_bt1
+            macd4_bt1, macd12_bt1
         )
 
     # нормализация
@@ -187,7 +280,7 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
 
     adx = {"4h": _adx_val(adx4), "12h": _adx_val(adx12)}
     dmi = {"4h": map_dmi(dmi4), "12h": map_dmi(dmi12)}
-    # фолбэк, если dmi пустой или без значений
+    # фолбэк, если dmi пустой или без значений (не дергаем plusdi/minusdi — используем dmi только)
     def pick(x, *keys):
         if not x:
             return None
@@ -211,26 +304,7 @@ async def fetch_taapi_bundle(symbol_usdt: str) -> dict:
             except Exception:
                 pass
         return None
-    if not dmi["4h"] or dmi["4h"].get("di_plus") is None or dmi["4h"].get("di_minus") is None:
-        dmi["4h"] = {
-            "di_plus":  pick(plusdi4,  "value", "plusdi", "valuePlusDi", "valuePlusDI"),
-            "di_minus": pick(minusdi4, "value", "minusdi", "valueMinusDi", "valueMinusDI"),
-        }
-    if not dmi["12h"] or dmi["12h"].get("di_plus") is None or dmi["12h"].get("di_minus") is None:
-        dmi["12h"] = {
-            "di_plus":  pick(plusdi12,  "value", "plusdi", "valuePlusDi", "valuePlusDI"),
-            "di_minus": pick(minusdi12, "value", "minusdi", "valueMinusDi", "valueMinusDI"),
-        }
-    if dmi["4h"].get("di_plus") is None or dmi["4h"].get("di_minus") is None:
-        try:
-            print("TAAPI DMI 4h raw:", dmi4, plusdi4, minusdi4)
-        except Exception:
-            pass
-    if dmi["12h"].get("di_plus") is None or dmi["12h"].get("di_minus") is None:
-        try:
-            print("TAAPI DMI 12h raw:", dmi12, plusdi12, minusdi12)
-        except Exception:
-            pass
+    # no extra calls to plusdi/minusdi; if DMI missing values, keep None
     macd = {"4h": map_macd(macd4), "12h": map_macd(macd12)}
     atr = {"4h": _to_float(atr4.get("value") if atr4 else None), "12h": _to_float(atr12.get("value") if atr12 else None)}
     mfi = {"4h": _to_float(mfi4.get("value") if mfi4 else None)}
@@ -449,20 +523,33 @@ EXPECTED_KEYS = {"symbol", "direction", "verdict", "score", "flags", "correction
 def _valid_llm(d: dict) -> bool:
     return isinstance(d, dict) and EXPECTED_KEYS.issubset(set(d.keys()))
 
-async def call_llm(llm_payload: dict) -> dict | None:
+_LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "1"))
+_LLM_SEM = asyncio.Semaphore(_LLM_MAX_CONCURRENCY)
+
+
+async def call_llm(llm_payload: dict, extra_text: str | None = None) -> dict | None:
     if not OPENAI_API_KEY:
         print("[LLM] OPENAI_API_KEY missing")
         return None
-    base = (OPENAI_BASE_URL or "https://api.openai.com").rstrip("/")
-    path = "/chat/completions" if base.endswith("/v1") else "/v1/chat/completions"
+    base = (OPENAI_BASE_URL or "https://api.openai.com/v1").rstrip("/")
+    path = "/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    user_content = PROMPT + "\n" + json.dumps(llm_payload, ensure_ascii=False)
+    # Compose user content: base prompt + optional history/dynamics block + payload JSON
+    history_block = ("\nИсторические данные по индикаторам за период наблюдения:\n" + extra_text) if extra_text else ""
+    user_content = PROMPT + history_block + "\n" + json.dumps(llm_payload, ensure_ascii=False)
     body = {
         "model": OPENAI_MODEL,
         "temperature": 0.25,
         "messages": [
-            {"role": "system", "content": "Ты опытный крипто-аналитик. Отвечай строго JSON, без текста вне JSON."},
+            {
+                "role": "system",
+                "content": (
+                    "Ты — трейдер-алгоритмист. Оценивай сетап по техническим данным и динамике индикаторов,"
+                    " давай краткий, но содержательный анализ с акцентом на изменение силы сигнала."
+                    " Всегда структурируй выводы и избегай воды. В конце верни ТОЛЬКО JSON строго по схеме."
+                ),
+            },
             {"role": "user", "content": user_content},
         ],
     }
@@ -472,28 +559,29 @@ async def call_llm(llm_payload: dict) -> dict | None:
     except Exception:
         pass
 
-    async with httpx.AsyncClient(timeout=60.0, base_url=base) as client:
-        r = await client.post(path, headers=headers, json=body)
-        if r.status_code != 200:
-            print("[LLM] HTTP", r.status_code, (r.text or "")[:500])
-            return None
-        raw = r.json()
-        content = raw["choices"][0]["message"]["content"]
-        try:
-            data = json.loads(content)
-        except Exception as e:
-            print("[LLM] parse err:", e, content[:300])
-            body["messages"][ -1]["content"] = "ВЕРНИ ТОЛЬКО JSON ПО СХЕМЕ.\n" + user_content
-            r2 = await client.post(path, headers=headers, json=body)
-            if r2.status_code != 200:
-                print("[LLM] HTTP(retry)", r2.status_code, (r2.text or "")[:500])
+    async with _LLM_SEM:
+        async with httpx.AsyncClient(timeout=60.0, base_url=base) as client:
+            r = await client.post(path, headers=headers, json=body)
+            if r.status_code != 200:
+                print("[LLM] HTTP", r.status_code, (r.text or "")[:500])
                 return None
-            content2 = r2.json()["choices"][0]["message"]["content"]
+            raw = r.json()
+            content = raw["choices"][0]["message"]["content"]
             try:
-                data = json.loads(content2)
-            except Exception as e2:
-                print("[LLM] parse err2:", e2, content2[:300])
-                return None
+                data = json.loads(content)
+            except Exception as e:
+                print("[LLM] parse err:", e, content[:300])
+                body["messages"][ -1]["content"] = "ВЕРНИ ТОЛЬКО JSON ПО СХЕМЕ.\n" + user_content
+                r2 = await client.post(path, headers=headers, json=body)
+                if r2.status_code != 200:
+                    print("[LLM] HTTP(retry)", r2.status_code, (r2.text or "")[:500])
+                    return None
+                content2 = r2.json()["choices"][0]["message"]["content"]
+                try:
+                    data = json.loads(content2)
+                except Exception as e2:
+                    print("[LLM] parse err2:", e2, content2[:300])
+                    return None
 
     if not _valid_llm(data):
         print("[LLM] invalid schema keys:", list(data.keys())[:20])
@@ -503,7 +591,14 @@ async def call_llm(llm_payload: dict) -> dict | None:
 
 # ========== главная точка для хендлера ==========
 
-async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = True) -> tuple[str, dict, Optional[dict]]:
+async def orchestrate_setup_flow(
+    parsed: dict,
+    PROMPT: str,
+    with_llm: bool = True,
+    history_data: list[dict] | None = None,
+    skip_heavy_tf: bool = False,
+    volume_context: dict | None = None,
+) -> tuple[str, dict, Optional[dict]]:
     """
     Вход: parsed из твоего бота (ticker, trend_balls, direction, tp, sl, current_price, key_levels)
     Выход: (human_preview_text, llm_payload, llm_result_or_none)
@@ -516,7 +611,7 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
         last_price = await fetch_last_price(symbol)
 
     # 2) TAAPI bundle (если у тебя уже есть свой — подставь сюда)
-    ta = await fetch_taapi_bundle(symbol)
+    ta = await fetch_taapi_bundle(symbol, skip_heavy_tf=skip_heavy_tf)
 
     # 3) деривативы и BTC фон (не критично, но полезно)
     funding, oi_chg = await fetch_derivatives_context(symbol)
@@ -524,6 +619,11 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
 
     # 4) сбор LLM payload
     llm_payload = build_llm_payload(parsed, ta, last_price, funding, oi_chg, btc_ctx)
+    if volume_context:
+        try:
+            llm_payload["volume_context"] = volume_context
+        except Exception:
+            pass
 
     # 5) превью для глаза
     preview = make_human_preview(llm_payload)
@@ -534,7 +634,28 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
         # добавим echo-guard, чтобы отлавливать эхо входа
         payload_for_llm = dict(llm_payload)
         payload_for_llm["_echo_guard"] = "DO_NOT_RETURN"
-        llm_result = await call_llm(payload_for_llm)
+        # Prepare optional short history block for the prompt
+        extra_txt = None
+        try:
+            if history_data:
+                # keep last 12 items, flatten key names for readability
+                tail = history_data[-12:]
+                compact = []
+                for r in tail:
+                    compact.append({
+                        "t": (r.get("timestamp") or "")[-8:],
+                        "ADX4h": r.get("adx4h"),
+                        "ADX12h": r.get("adx12h"),
+                        "MACD4h": r.get("macd4h"),
+                        "MACD12h": r.get("macd12h"),
+                        "RSI12h": r.get("rsi12h"),
+                        "OBV": r.get("obv_trend"),
+                    })
+                import json as _json
+                extra_txt = _json.dumps(compact, ensure_ascii=False)
+        except Exception:
+            extra_txt = None
+        llm_result = await call_llm(payload_for_llm, extra_text=extra_txt)
         try:
             if isinstance(llm_result, dict):
                 logger.info("[PIPE] got llm_result keys: %s", list(llm_result.keys()))
@@ -574,12 +695,15 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
                 llm_result["confidence"] = max(1, min(10, int(round(score/10))))
         except Exception:
             pass
-        # Нормализация confidence и confidence_text в любом случае
+        # Нормализация score/confidence в любом случае (гарантия чисел)
         try:
-            if isinstance(llm_result, dict) and isinstance(llm_result.get("score"), (int, float)):
-                _conf = int(max(1, min(10, round(float(llm_result.get("score")) / 10))))
-                llm_result["confidence"] = _conf
-                llm_result["confidence_text"] = f"{_conf*10}% уверенности"
+            if not isinstance(llm_result, dict):
+                llm_result = {}
+            if not isinstance(llm_result.get("score"), (int, float)):
+                llm_result["score"] = compute_fallback_score(llm_payload)
+            _conf = int(max(1, min(10, round(float(llm_result.get("score")) / 10))))
+            llm_result["confidence"] = _conf
+            llm_result["confidence_text"] = f"{_conf*10}% уверенности"
         except Exception:
             pass
         # Маппинг вердикта по шкале
@@ -879,6 +1003,14 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
 
             def validate_and_fix_grid(res: dict, direction: str, current_price: Optional[float], atr4: Optional[float], key_band: Optional[tuple[float, float]], hard_stop_value: Optional[float]):
                 g = res.get("grid") or {}
+                # Ensure single TP mode tied to setup TP if present
+                try:
+                    setup_tp = (llm_payload.get("setup_parsed") or {}).get("tp")
+                    if setup_tp is not None:
+                        g.setdefault("mode", "single_tp")
+                        g["tp_single"] = float(setup_tp)
+                except Exception:
+                    pass
                 sl = g.get("hard_stop")
                 entries = g.get("entries") or []
                 mode = g.get("mode") or "single_tp"
@@ -1033,6 +1165,16 @@ async def orchestrate_setup_flow(parsed: dict, PROMPT: str, with_llm: bool = Tru
             if kv and kv.get("min") is not None and kv.get("max") is not None:
                 key_band = (float(kv.get("min")), float(kv.get("max")))
             sl_value = (llm_payload.get("setup_parsed") or {}).get("sl")
+            # Force single TP grid from setup tp before validation
+            try:
+                setup_tp = (llm_payload.get("setup_parsed") or {}).get("tp")
+                if setup_tp is not None:
+                    llm_result = llm_result or {}
+                    llm_result.setdefault("grid", {})
+                    llm_result["grid"]["mode"] = "single_tp"
+                    llm_result["grid"]["tp_single"] = float(setup_tp)
+            except Exception:
+                pass
             llm_result = validate_and_fix_grid(llm_result, dirn, cp, atr4, key_band, sl_value)
         except Exception:
             pass

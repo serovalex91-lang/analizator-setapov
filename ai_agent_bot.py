@@ -61,9 +61,12 @@ FORWARD_TARGET_ID = int(os.getenv("FORWARD_TARGET_ID", "0"))
 FORWARD_PREFIX = os.getenv("FORWARD_PREFIX", "📡 AUTO")
 FORWARD_THRESHOLD = int(os.getenv("FORWARD_THRESHOLD", "70"))
 WATCH_THRESHOLD = int(os.getenv("WATCH_THRESHOLD", "70"))
-WATCH_WINDOW_HOURS = int(os.getenv("WATCH_WINDOW_HOURS", "12"))
-WATCH_INTERVAL_MIN = int(os.getenv("WATCH_INTERVAL_MIN", "60"))
+WATCH_WINDOW_HOURS = int(os.getenv("WATCH_WINDOW_HOURS", "48"))
+WATCH_INTERVAL_MIN = int(os.getenv("WATCH_INTERVAL_MIN", "15"))
 SHOW_DEBUG = os.getenv("SHOW_DEBUG", "0") == "1"
+# Defaults used by /watch handler
+WATCH_DEFAULT_HOURS = int(os.getenv("WATCH_DEFAULT_HOURS", os.getenv("WATCH_WINDOW_HOURS", "48")))
+WATCH_ENTER_SCORE = float(os.getenv("WATCH_ENTER_SCORE", os.getenv("WATCH_THRESHOLD", "70")))
 
 
 logging.basicConfig(
@@ -104,6 +107,12 @@ class ConversationStore:
 
 
 conv_store = ConversationStore(max_messages_per_chat=12)
+
+# Simple per-chat flood/dup guards
+_chat_locks: Dict[int, asyncio.Lock] = {}
+_processed_msgs: set[tuple[int, int]] = set()
+_last_llm_ts: Dict[int, float] = {}
+LLM_CHAT_COOLDOWN_SEC = int(os.getenv("LLM_CHAT_COOLDOWN_SEC", "5"))
 
 
 def _require_config() -> None:
@@ -249,7 +258,8 @@ async def forward_to_channel(tg: TelegramClient, parsed: dict, llm_result: dict)
 
 async def maybe_forward_or_watch(tg: TelegramClient, parsed: dict, llm_result: dict) -> None:
     try:
-        score = int(llm_result.get("score", 0))
+        raw = llm_result.get("score", 0)
+        score = int(round(float(raw))) if raw is not None else 0
     except Exception:
         score = 0
     key = setup_key(parsed)
@@ -266,9 +276,13 @@ async def maybe_forward_or_watch(tg: TelegramClient, parsed: dict, llm_result: d
         except Exception:
             pass
         return
-    if 40 <= score < FORWARD_THRESHOLD:
+    if WATCH_THRESHOLD <= score < FORWARD_THRESHOLD:
         # enqueue watch if not exists
         try:
+            # limit concurrent watches
+            MAX_ACTIVE_WATCHERS = int(os.getenv("MAX_ACTIVE_WATCHERS", "3"))
+            if len(REG.watches) >= MAX_ACTIVE_WATCHERS:
+                return
             if key not in REG.watches:
                 now = time.time()
                 wi = WatchItem(
@@ -511,6 +525,8 @@ async def main() -> None:
 
     tg = build_client()
     await tg.start(bot_token=TELEGRAM_BOT_TOKEN)
+    me = await tg.get_me()
+    MY_ID = getattr(me, "id", None)
 
     logger.info("AI Telegram bot started. Waiting for messages…")
     # Log effective config once
@@ -641,7 +657,8 @@ async def main() -> None:
         watch.deadline_ts = time.time() + hours_i * 3600
         await event.respond(f"Запущено наблюдение #{watch.id}: {hours_i}ч, интервал {interval_i}м, порог {threshold_f}")
 
-        async def _watch_loop() -> None:
+        # rename to avoid collision with watcher._watch_loop
+        async def _manual_watch_loop() -> None:
             while True:
                 now = time.time()
                 if now >= watch.deadline_ts:
@@ -695,13 +712,114 @@ async def main() -> None:
                 # sleep until next iteration
                 await asyncio.sleep(interval_i * 60 + random.uniform(0, 0.5))
 
-        asyncio.create_task(_watch_loop())
+        asyncio.create_task(_manual_watch_loop())
+
+    def render_signal_message(parsed: dict, llm: dict) -> str:
+        try:
+            sym = (llm.get("symbol") or ((parsed.get("ticker") or "") + "USDT")).upper()
+        except Exception:
+            sym = ((parsed.get("ticker") or "") + "USDT").upper()
+        dirn = (llm.get("direction") or parsed.get("direction") or "").upper()
+        score = llm.get("score")
+        verdict = llm.get("verdict")
+        sp = parsed.get("key_levels") or {}
+        band = f"{sp.get('min')}–{sp.get('max')}" if sp else "—"
+        sl = (llm.get("plan", {}) or {}).get("sl") or parsed.get("sl")
+        tp = (llm.get("plan", {}) or {}).get("tp") or parsed.get("tp")
+        plan = llm.get("plan") or {}
+        entries = plan.get("entries") or []
+        blended_rr = plan.get("blended_rr")
+
+        lines = []
+        # Header with score
+        lines.append(f"**{sym} — {dirn} | Score: {score}/100 ({verdict})**")
+        try:
+            balls = " ".join(parsed.get("trend_balls") or [])
+        except Exception:
+            balls = ""
+        lines.append(f"Контекст: TREND {balls} · Зона: {band} · SL {sl} · TP {tp}")
+
+        # План входа
+        lines.append("")
+        lines.append("**План входа (откат к зоне):**")
+        if entries:
+            eligible_entries = [e for e in entries if e.get("eligible")]
+            pts = " / ".join([f"{e.get('price')}" for e in eligible_entries]) if eligible_entries else ""
+            wts = ", ".join([f"{e.get('weight',0)}%" for e in eligible_entries]) if eligible_entries else ""
+            rrs = ", ".join([f"{e.get('rr')}" for e in eligible_entries]) if eligible_entries else ""
+            if pts: lines.append(f"Ступени: {pts}")
+            if wts: lines.append(f"Вес: {wts}")
+            if rrs: lines.append(f"RR ступеней: {rrs}")
+        if blended_rr is not None:
+            lines.append(f"Сводный RR: {blended_rr}")
+
+        # Триггеры
+        trg = llm.get("triggers") or {}
+        conf = trg.get("confirm") or []
+        avoid = trg.get("avoid") or []
+        if conf:
+            lines.append("")
+            lines.append("**Подтверждение (любой 1–2):**")
+            for t in conf[:5]:
+                lines.append(f"• {t}")
+        if avoid:
+            lines.append("**Избегаем входа, если:**")
+            for t in avoid[:4]:
+                lines.append(f"• {t}")
+
+        # Менеджмент
+        mng = llm.get("management") or {}
+        pfix = mng.get("partial_tp") or []
+        if pfix:
+            lines.append("")
+            lines.append("**Менеджмент и фикса:**")
+            for z in pfix[:3]:
+                z1, z2 = (z.get("zone") or [None, None])
+                lines.append(f"• Частично: {z.get('size_pct','?')}% @ {z1}–{z2}")
+        if mng.get("final_tp") is not None:
+            lines.append(f"• Финальная цель: {mng.get('final_tp')}")
+        if mng.get("breakeven_after"):
+            try:
+                z1, z2 = mng["breakeven_after"]
+                lines.append(f"• БУ после достижения {z1}–{z2}")
+            except Exception:
+                pass
+
+        # Инвалидация
+        inv = llm.get("invalidation") or {}
+        if inv:
+            lines.append("")
+            lines.append("**Инвалидация / отмена:**")
+            if inv.get("hard_sl") is not None:
+                lines.append(f"• Жёсткий SL: {inv.get('hard_sl')}")
+            for c in (inv.get("cancel_if") or [])[:4]:
+                lines.append(f"• {c}")
+
+        # Мониторинг
+        mon = llm.get("monitoring") or {}
+        if mon:
+            lines.append("")
+            lines.append(f"**Мониторинг ({mon.get('window_h','48')}ч):**")
+            for p in (mon.get("promote_when") or [])[:3]:
+                lines.append(f"• Повышаем приоритет: {p}")
+            for d in (mon.get("downgrade_when") or [])[:2]:
+                lines.append(f"• Понижаем приоритет: {d}")
+        return "\n".join(lines)
 
     @tg.on(events.NewMessage())
     async def _(event):  # noqa: ANN001
         text = (event.raw_text or "").strip()
         if not text or text.startswith("/"):
             return
+        # 1) не реагируем на свои сообщения вообще
+        try:
+            if getattr(event, "out", False):
+                return
+            sid = getattr(event, "sender_id", None)
+            if MY_ID is not None and sid == MY_ID:
+                return
+        except Exception:
+            pass
         # ignore our auto-forwards and messages from the target channel
         if text.lstrip().startswith(FORWARD_PREFIX):
             return
@@ -713,6 +831,34 @@ async def main() -> None:
         try:
             # Attempt to parse screener/setup message first
             parsed = parse_setup_message(text)
+            # Deduplicate by (chat_id, msg_id)
+            try:
+                mid = getattr(event, "message", None).id if getattr(event, "message", None) else None
+                cid = getattr(event, "chat_id", None)
+                if cid is not None and mid is not None:
+                    key = (int(cid), int(mid))
+                    if key in _processed_msgs:
+                        return
+                    _processed_msgs.add(key)
+            except Exception:
+                pass
+
+            # Per-chat serialization + cooldown to avoid bursts
+            try:
+                cid = getattr(event, "chat_id", None)
+                if cid is not None:
+                    lock = _chat_locks.setdefault(int(cid), asyncio.Lock())
+                    if lock.locked():
+                        return  # skip concurrent duplicates
+                    async with lock:
+                        now = time.time()
+                        last = _last_llm_ts.get(int(cid), 0.0)
+                        if now - last < LLM_CHAT_COOLDOWN_SEC:
+                            return
+                        _last_llm_ts[int(cid)] = now
+                        # fall through to normal handling below within the lock
+            except Exception:
+                pass
             if parsed and parsed.get("ticker") and parsed.get("trend_balls"):
                 # attach meta
                 try:
@@ -745,67 +891,8 @@ async def main() -> None:
                         except Exception:
                             pass
                         try:
-                            # 1) Итог
-                            def render_conclusion(res: dict) -> str:
-                                c = res.get("conclusion") or {}
-                                head = c.get("headline") or "Итог недоступен"
-                                bullets = c.get("bullets") or []
-                                inv = c.get("invalidation") or ""
-                                lines = [f"🧾 *Итог:* {head}"]
-                                for b in bullets[:6]:
-                                    lines.append(f"• {b}")
-                                if inv:
-                                    lines.append(f"_Инвалидация:_ {inv}")
-                                return "\n".join(lines)
-
-                            concl_text = render_conclusion(llm_result)
-                            await tg.send_message(event.chat_id, concl_text, parse_mode="Markdown")
-
-                            # 2) Тактика
-                            def render_tactical(tc: dict | None) -> str:
-                                if not tc:
-                                    return ""
-                                lines = ["🎯 *Тактика:*", tc.get("summary", "—")]
-                                grid_levels = tc.get("grid_levels") if isinstance(tc, dict) else None
-                                if isinstance(grid_levels, list) and grid_levels:
-                                    lines.append("📐 *Сетка:* " + " / ".join(map(str, grid_levels)))
-                                adv = tc.get("advice")
-                                if isinstance(adv, list):
-                                    for a in adv[:5]:
-                                        lines.append(f"• {a}")
-                                return "\n".join(lines)
-
-                            tact = llm_result.get("tactical_comment") if isinstance(llm_result, dict) else None
-                            tact_text = render_tactical(tact)
-                            if tact_text:
-                                await tg.send_message(event.chat_id, tact_text, parse_mode="Markdown")
-
-                            # 3) Сетка
-                            g = llm_result.get("grid") if isinstance(llm_result, dict) else None
-                            if isinstance(g, dict):
-                                entries = g.get("entries") or []
-                                if isinstance(entries, list) and entries:
-                                    lines = ["🧱 *Сетка (RR≥3, SL фикс):*"]
-                                    for idx, e in enumerate(entries[:5], start=1):
-                                        price = e.get("price")
-                                        tpv = e.get("tp")
-                                        rr = e.get("rr")
-                                        ok = bool(e.get("eligible"))
-                                        mark = "✅" if ok else "✖️"
-                                        lines.append(f"{idx}) {price} → TP {tpv} (RR {rr}) {mark}")
-                                    blended = g.get("blended_rr")
-                                    sl_v = g.get("hard_stop")
-                                    cons = g.get("constraints") or {}
-                                    stepv = cons.get("step_atr_4h")
-                                    band = cons.get("used_key_level_band")
-                                    lines.append(f"Blended RR: {blended}")
-                                    tail = f"SL: {sl_v}"
-                                    if stepv is not None:
-                                        tail += f" | шаг ≈ {stepv}×ATR"
-                                    if isinstance(band, list) and len(band) == 2:
-                                        tail += f" | Band: {band[0]}–{band[1]}"
-                                    lines.append(tail)
-                                await tg.send_message(event.chat_id, "\n".join(lines), parse_mode="Markdown")
+                            msg = render_signal_message(parsed, llm_result)
+                            await tg.send_message(event.chat_id, msg, parse_mode="Markdown")
                         except Exception:
                             pass
                     else:
@@ -815,17 +902,8 @@ async def main() -> None:
                     await event.respond("Parsed setup:\n" + json.dumps(parsed, ensure_ascii=False, indent=2))
                 return
 
-            await event.respond("Думаю…")
+            # общий чат без сетапа — короткий ответ модели (без плейсхолдеров)
             reply = await _generate_ai_response(oa, event.chat_id, text)
-            # Edit previous status message to keep chat tidy
-            try:
-                await asyncio.sleep(0.1)
-                async for msg in tg.iter_messages(event.chat_id, limit=1):
-                    if msg and msg.message == "Думаю…":
-                        await msg.edit(reply)
-                        return
-            except Exception:
-                pass
             await event.respond(reply)
         except FloodWaitError as fw:
             logger.warning("Flood wait: sleeping for %s seconds", fw.seconds)
