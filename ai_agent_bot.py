@@ -275,6 +275,28 @@ async def maybe_forward_or_watch(tg: TelegramClient, parsed: dict, llm_result: d
             REG.last_forwarded_keys[key] = time.time()
         except Exception:
             pass
+        # Auto-start watcher in post_entry phase for accompaniment
+        try:
+            MAX_ACTIVE_WATCHERS = int(os.getenv("MAX_ACTIVE_WATCHERS", "3"))
+            if len(REG.watches) < MAX_ACTIVE_WATCHERS and key not in REG.watches:
+                now = time.time()
+                wi = WatchItem(
+                    key=key,
+                    payload={"parsed": parsed, "last_llm": llm_result},
+                    started_ts=now,
+                    deadline_ts=now + WATCH_WINDOW_HOURS * 3600,
+                    interval_sec=WATCH_INTERVAL_MIN * 60,
+                    threshold=WATCH_THRESHOLD,
+                    phase="post_entry",
+                    entry_price=parsed.get("current_price"),
+                    tp=parsed.get("tp"),
+                    sl=parsed.get("sl"),
+                    holding_since=now,
+                )
+                REG.watches[key] = wi
+                asyncio.create_task(_watch_loop(tg, wi))
+        except Exception:
+            pass
         return
     if WATCH_THRESHOLD <= score < FORWARD_THRESHOLD:
         # enqueue watch if not exists
