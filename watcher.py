@@ -84,7 +84,7 @@ REG = _Registry()
 
 
 async def _watch_loop(tg, wi: WatchItem) -> None:
-    from cursor_pipeline import orchestrate_setup_flow, fetch_last_price  # lazy import to avoid cycles
+    from cursor_pipeline import orchestrate_setup_flow  # lazy import to avoid cycles
     from llm_prompt import PROMPT
     logger = logging.getLogger("watcher")
     logger.info("WATCH started: key=%s", wi.key)
@@ -138,6 +138,28 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
         except Exception:
             return 0.0
 
+    async def fetch_futures_price(symbol_usdt: str) -> Optional[float]:
+        """Prefer Binance Futures mark price; fallback to last price."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Mark price (premiumIndex)
+                r = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": symbol_usdt.upper()})
+                if r.status_code == 200:
+                    jd = r.json() or {}
+                    mp = jd.get("markPrice")
+                    if mp is not None:
+                        return float(mp)
+                # Fallback: futures last price
+                r2 = await client.get("https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol_usdt.upper()})
+                if r2.status_code == 200:
+                    jd2 = r2.json() or {}
+                    px = jd2.get("price")
+                    if px is not None:
+                        return float(px)
+        except Exception:
+            return None
+        return None
+
     async def detect_volume_spike(symbol_usdt: str) -> dict:
         c5 = await fetch_candles(symbol_usdt, "5m", limit=36)
         if len(c5) < 3:
@@ -181,14 +203,14 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             wi.step_count += 1
             skip_heavy = (wi.step_count % 3) != 0  # обновляем тяжёлые ТФ раз в 3 тика (~45 мин)
             hist = (REG.history.get(wi.key) or [])[-16:]
-            # SL auto-stop check before heavy work
+            # SL auto-stop check before heavy work (use Futures mark/last price)
             symbol = (parsed.get("ticker") or "").upper()
             direction = (parsed.get("direction") or "").lower()
             hard_sl = (wi.sl if wi.sl is not None else parsed.get("sl"))
             px_now = None
             if symbol and hard_sl is not None:
                 try:
-                    px_now = await fetch_last_price(f"{symbol}USDT")
+                    px_now = await fetch_futures_price(f"{symbol}USDT")
                 except Exception:
                     px_now = None
             if px_now is not None and direction in ("long", "short"):
