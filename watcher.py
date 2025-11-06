@@ -3,6 +3,7 @@ import os
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import Literal
 import logging
 from typing import Any, Dict, Optional
 import statistics
@@ -29,6 +30,12 @@ class WatchItem:
     forwarded: bool = False
     last_score: Optional[int] = None
     step_count: int = 0
+    # New state for extended watcher flow
+    phase: Literal["pre_entry", "post_entry"] = "pre_entry"
+    entry_price: Optional[float] = None
+    tp: Optional[float] = None
+    sl: Optional[float] = None
+    holding_since: Optional[float] = None
 
 
 class _Registry:
@@ -162,6 +169,14 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             return
         try:
             parsed = wi.payload["parsed"]
+            # cache baseline levels to WatchItem
+            try:
+                if wi.tp is None:
+                    wi.tp = parsed.get("tp")
+                if wi.sl is None:
+                    wi.sl = parsed.get("sl")
+            except Exception:
+                pass
             # Prepare recent indicator history for this watch (last 16 points)
             wi.step_count += 1
             skip_heavy = (wi.step_count % 3) != 0  # обновляем тяжёлые ТФ раз в 3 тика (~45 мин)
@@ -169,7 +184,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             # SL auto-stop check before heavy work
             symbol = (parsed.get("ticker") or "").upper()
             direction = (parsed.get("direction") or "").lower()
-            hard_sl = parsed.get("sl")
+            hard_sl = (wi.sl if wi.sl is not None else parsed.get("sl"))
             px_now = None
             if symbol and hard_sl is not None:
                 try:
@@ -187,6 +202,22 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         pass
                     REG.watches.pop(wi.key, None)
                     return
+            # TP auto-finish in post_entry
+            try:
+                hard_tp = (wi.tp if wi.tp is not None else parsed.get("tp"))
+                if px_now is not None and hard_tp is not None and direction in ("long","short") and wi.phase == "post_entry":
+                    tp_hit = (direction == "long" and px_now >= hard_tp) or (direction == "short" and px_now <= hard_tp)
+                    if tp_hit:
+                        try:
+                            src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                            if src_chat:
+                                await tg.send_message(src_chat, f"🎯 {symbol}: цель {float(hard_tp):.4f} достигнута. Наблюдение завершено.")
+                        except Exception:
+                            pass
+                        REG.watches.pop(wi.key, None)
+                        return
+            except Exception:
+                pass
 
             # 5m volume spike detector
             vol_sym = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
@@ -201,11 +232,17 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             sc = int(llm_res.get("score", 0)) if (use_llm and isinstance(llm_res, dict)) else (wi.last_score or 0)
             wi.last_score = sc
             logger.info("WATCH tick: key=%s last_score=%s threshold=%s", wi.key, wi.last_score, wi.threshold)
-            # act-based alerts from LLM
+            # act-based alerts from LLM (phase-aware)
             try:
                 act = (llm_res or {}).get("action") or {}
                 rec = (act.get("recommendation") or "").lower()
+                phase = (act.get("phase") or wi.phase or "pre_entry").lower()
                 src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                if wi.phase == "post_entry" and rec == "hold" and src_chat and _should_alert("hold", cooldown_sec=900):
+                    try:
+                        await tg.send_message(src_chat, f"📈 {symbol}: тренд усиливается, держим позицию. Score {wi.last_score}/100.")
+                    except Exception:
+                        pass
                 if rec in ("avoid", "exit_immediate") and src_chat and _should_alert(rec):
                     if rec == "avoid":
                         msg = f"⚠️ {symbol}: условия ухудшились — вход ОТМЕНИТЬ. Причина: {act.get('reason','')}"
@@ -215,6 +252,15 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         await tg.send_message(src_chat, msg)
                         REG.watches.pop(wi.key, None)
                         return
+                # promote phase if LLM signals post_entry explicitly
+                try:
+                    if wi.phase == "pre_entry" and phase == "post_entry":
+                        wi.phase = "post_entry"
+                        if wi.entry_price is None:
+                            wi.entry_price = parsed.get("current_price") or px_now
+                        wi.holding_since = wi.holding_since or time.time()
+                except Exception:
+                    pass
             except Exception:
                 pass
             # score-based cancel hint
@@ -247,10 +293,10 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                 REG.history[wi.key] = buf
             except Exception:
                 pass
-            # block entry on opposite volume spike
+            # block entry on opposite volume spike (pre_entry only)
             try:
                 block_by_volume = False
-                if (vol_ctx or {}).get("spike"):
+                if wi.phase == "pre_entry" and (vol_ctx or {}).get("spike"):
                     if direction == "short" and (vol_ctx or {}).get("dir") == "up":
                         block_by_volume = True
                     if direction == "long" and (vol_ctx or {}).get("dir") == "down":
@@ -261,17 +307,25 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             except Exception:
                 pass
 
-            if (wi.last_score or 0) >= wi.threshold:
-                logger.info("WATCH promote to FORWARD: key=%s score=%s", wi.key, wi.last_score)
-                try:
-                    from ai_agent_bot import forward_to_channel
-                    await forward_to_channel(tg, parsed, llm_res)
-                except Exception:
-                    pass
-                wi.forwarded = True
-                REG.last_forwarded_keys[wi.key] = time.time()
-                REG.watches.pop(wi.key, None)
-                return
+            # Phase logic
+            try:
+                if wi.phase == "pre_entry" and (wi.last_score or 0) >= wi.threshold:
+                    # Confirm entry, switch to post_entry, do not stop watching
+                    src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                    if src_chat and _should_alert("enter_confirm", cooldown_sec=600):
+                        await tg.send_message(src_chat, f"✅ {symbol}: сетап подтвердился (score {wi.last_score}/100). Можно входить.")
+                    wi.phase = "post_entry"
+                    if wi.entry_price is None:
+                        wi.entry_price = parsed.get("current_price") or px_now
+                    wi.holding_since = wi.holding_since or time.time()
+                elif wi.phase == "post_entry":
+                    # Weakening alert
+                    if (wi.last_score or 0) < 40 and _should_alert("weak_post", cooldown_sec=1200):
+                        src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                        if src_chat:
+                            await tg.send_message(src_chat, f"⚠️ {symbol}: тренд ослаб, стоит подумать о частичной фиксации.")
+            except Exception:
+                pass
         except Exception:
             logger.exception("WATCH tick error: key=%s", wi.key)
         await asyncio.sleep(wi.interval_sec)

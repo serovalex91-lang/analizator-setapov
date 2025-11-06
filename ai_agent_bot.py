@@ -739,6 +739,33 @@ async def main() -> None:
             balls = ""
         lines.append(f"Контекст: TREND {balls} · Зона: {band} · SL {sl} · TP {tp}")
 
+        # Тактика и действие (если есть)
+        try:
+            tact = llm.get("tactical_comment") or llm.get("conclusion")
+            act = llm.get("action") or {}
+            rec = act.get("recommendation")
+            reason = act.get("reason")
+            if tact or rec:
+                lines.append("")
+                lines.append("**Тактика:**")
+                if tact:
+                    lines.append(f"• {tact}")
+                if rec:
+                    lines.append(f"• Действие: {rec}{(' — ' + reason) if reason else ''}")
+        except Exception:
+            pass
+
+        # Риски (флаги)
+        try:
+            flags = llm.get("flags") or []
+            if isinstance(flags, list) and flags:
+                lines.append("")
+                lines.append("**Риски:**")
+                for f in flags[:4]:
+                    lines.append(f"• {f}")
+        except Exception:
+            pass
+
         # План входа
         lines.append("")
         lines.append("**План входа (откат к зоне):**")
@@ -750,6 +777,22 @@ async def main() -> None:
             if pts: lines.append(f"Ступени: {pts}")
             if wts: lines.append(f"Вес: {wts}")
             if rrs: lines.append(f"RR ступеней: {rrs}")
+        else:
+            # Фолбэк: показать proposals, если план пуст
+            props = llm.get("proposals") or []
+            if props:
+                for p in props[:3]:
+                    try:
+                        method = p.get("method") or ""
+                        ent = p.get("entry")
+                        if ent == "use_current":
+                            ent = parsed.get("current_price")
+                        sl1 = p.get("sl")
+                        tp1 = p.get("tp")
+                        rr1 = p.get("rr")
+                        lines.append(f"• {method}: entry {ent}, SL {sl1}, TP {tp1}, RR {rr1}")
+                    except Exception:
+                        continue
         if blended_rr is not None:
             lines.append(f"Сводный RR: {blended_rr}")
 
@@ -892,9 +935,12 @@ async def main() -> None:
                             pass
                         try:
                             msg = render_signal_message(parsed, llm_result)
-                            await tg.send_message(event.chat_id, msg, parse_mode="Markdown")
-                        except Exception:
-                            pass
+                            try:
+                                await event.respond(msg)
+                            except Exception:
+                                await tg.send_message(event.chat_id, msg)
+                        except Exception as e:
+                            logger.exception("Failed to send message: %s", e)
                     else:
                         await event.respond("❕ LLM недоступен или ответ пуст.")
                 except Exception:
