@@ -17,6 +17,8 @@ BINANCE_FUT = "https://fapi.binance.com"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+FAST_TF_ENABLED = int(os.getenv("FAST_TF_ENABLED", "1"))
+FAST_TF_SCORE_CAP = int(os.getenv("FAST_TF_SCORE_CAP", "10"))  # max ±10 influence from fast TF
 
 # Тайм-ауты/ретраи
 HTTP_TIMEOUT = 10.0
@@ -701,6 +703,18 @@ async def orchestrate_setup_flow(
                 llm_result = {}
             if not isinstance(llm_result.get("score"), (int, float)):
                 llm_result["score"] = compute_fallback_score(llm_payload)
+            # Применяем кап влияния fast-TF: итоговый score не может отклоняться от HTF-базы > ±FAST_TF_SCORE_CAP
+            if FAST_TF_ENABLED:
+                try:
+                    base_htf = compute_fallback_score(llm_payload)  # 4h/12h + RR/balls
+                    s_llm = float(llm_result.get("score"))
+                    delta = s_llm - float(base_htf)
+                    cap = float(max(0, FAST_TF_SCORE_CAP))
+                    clamped = base_htf + max(-cap, min(cap, delta))
+                    final_score = int(max(0, min(100, round(clamped))))
+                    llm_result["score"] = final_score
+                except Exception:
+                    pass
             _conf = int(max(1, min(10, round(float(llm_result.get("score")) / 10))))
             llm_result["confidence"] = _conf
             llm_result["confidence_text"] = f"{_conf*10}% уверенности"

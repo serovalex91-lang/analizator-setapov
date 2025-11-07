@@ -17,6 +17,24 @@ FORWARD_PREFIX = os.getenv("FORWARD_PREFIX", "📡 AUTO")
 # Default polling interval is 15 minutes (can be overridden by env in creator of WatchItem)
 WATCH_INTERVAL_MIN = int(os.getenv("WATCH_INTERVAL_MIN", "15"))
 WATCH_THRESHOLD = int(os.getenv("WATCH_THRESHOLD", "70"))
+FORWARD_THRESHOLD = int(os.getenv("FORWARD_THRESHOLD", "60"))
+
+# Hysteresis & cooldowns (minutes)
+ENTRY_HYSTERESIS = int(os.getenv("ENTRY_HYSTERESIS", "5"))  # open ≥60, close ≤60-5
+ENTRY_ALERT_COOLDOWN_MIN = int(os.getenv("ENTRY_ALERT_COOLDOWN_MIN", "60"))
+HOLD_ALERT_COOLDOWN_MIN = int(os.getenv("HOLD_ALERT_COOLDOWN_MIN", "120"))
+TP_EXTEND_COOLDOWN_MIN = int(os.getenv("TP_EXTEND_COOLDOWN_MIN", "180"))
+DANGER_ALERT_COOLDOWN_MIN = int(os.getenv("DANGER_ALERT_COOLDOWN_MIN", "60"))
+
+# Post-entry score gates
+HOLD_MIN_SCORE = int(os.getenv("HOLD_MIN_SCORE", "60"))
+DOWNGRADE_SCORE = int(os.getenv("DOWNGRADE_SCORE", "45"))
+EXIT_SCORE = int(os.getenv("EXIT_SCORE", "35"))
+
+# TP extension rules
+TP_EXTENSION_MAX = float(os.getenv("TP_EXTENSION_MAX", "0.20"))  # +20% cap
+TP_EXTENSION_STEP_ATR4H = float(os.getenv("TP_EXTENSION_STEP_ATR4H", "1.0"))
+TP_EXTENSION_MIN_DELTA_ATR = float(os.getenv("TP_EXTENSION_MIN_DELTA_ATR", "0.5"))
 
 
 @dataclass
@@ -36,6 +54,13 @@ class WatchItem:
     tp: Optional[float] = None
     sl: Optional[float] = None
     holding_since: Optional[float] = None
+    # entry-window state
+    entry_window_open: bool = False
+    _entry_ok_streak: int = 0
+    _entry_bad_streak: int = 0
+    # TP extension state
+    _last_tp_extend_ts: float = 0.0
+    _base_tp_initial: Optional[float] = None
 
 
 class _Registry:
@@ -268,13 +293,23 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                 except Exception:
                     pass
             logger.info("WATCH tick: key=%s last_score=%s threshold=%s", wi.key, (wi.last_score if wi.last_score is not None else "n/a"), wi.threshold)
+            # keep a small buffer of scores for trend checks
+            try:
+                score_series = (wi.payload.get("_score_series") or [])
+                if wi.last_score is not None:
+                    score_series.append(int(wi.last_score))
+                    if len(score_series) > 16:
+                        score_series = score_series[-16:]
+                wi.payload["_score_series"] = score_series
+            except Exception:
+                pass
             # act-based alerts from LLM (phase-aware)
             try:
                 act = (llm_res or {}).get("action") or {}
                 rec = (act.get("recommendation") or "").lower()
                 phase = (act.get("phase") or wi.phase or "pre_entry").lower()
                 src_chat = parsed.get("_meta", {}).get("src_chat_id")
-                if wi.phase == "post_entry" and rec == "hold" and src_chat and _should_alert("hold", cooldown_sec=900):
+                if wi.phase == "post_entry" and rec == "hold" and src_chat and _should_alert("hold", cooldown_sec=HOLD_ALERT_COOLDOWN_MIN*60):
                     try:
                         await tg.send_message(src_chat, f"📈 {symbol}: тренд усиливается, держим позицию. Score {wi.last_score}/100.")
                     except Exception:
@@ -285,7 +320,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                             await tg.send_message(FORWARD_TARGET_ID, f"📈 [{symbol}] k={kshort} — держим позицию. Score {wi.last_score}/100.")
                     except Exception:
                         pass
-                if rec in ("avoid", "exit_immediate") and src_chat and _should_alert(rec):
+                if rec in ("avoid", "exit_immediate") and src_chat and _should_alert(rec, cooldown_sec=DANGER_ALERT_COOLDOWN_MIN*60):
                     if rec == "avoid":
                         msg = f"⚠️ {symbol}: условия ухудшились — вход ОТМЕНИТЬ. Причина: {act.get('reason','')}"
                         await tg.send_message(src_chat, msg)
@@ -317,17 +352,16 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     pass
             except Exception:
                 pass
-            # score-based cancel hint
+            # score-based cancel/danger hint (anti-spam cooldown)
             try:
-                cancel_score = int(os.getenv("CANCEL_SCORE", "35"))
-                if wi.last_score is not None and wi.last_score <= cancel_score and _should_alert("score_low"):
+                if wi.phase == "post_entry" and wi.last_score is not None and wi.last_score <= DOWNGRADE_SCORE and _should_alert("danger", cooldown_sec=DANGER_ALERT_COOLDOWN_MIN*60):
                     src_chat = parsed.get("_meta", {}).get("src_chat_id")
                     if src_chat:
-                        await tg.send_message(src_chat, f"⚠️ {symbol}: score упал до {wi.last_score}/100 — идею лучше ОТМЕНИТЬ.")
+                        await tg.send_message(src_chat, f"⚠️ {symbol}: тренд ослаб (score {wi.last_score}/100). Рекомендуется частичная фиксация.")
                     try:
                         if FORWARD_TARGET_ID:
                             kshort = wi.key[:6]
-                            await tg.send_message(FORWARD_TARGET_ID, f"⚠️ [{symbol}] k={kshort} — score={wi.last_score}/100 → лучше отменить.")
+                            await tg.send_message(FORWARD_TARGET_ID, f"⚠️ [{symbol}] k={kshort} — тренд ослаб (score {wi.last_score}/100).")
                     except Exception:
                         pass
             except Exception:
@@ -367,28 +401,70 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
             except Exception:
                 pass
 
-            # Phase logic
+            # Phase logic with anti-spam transitions and hysteresis
             try:
-                if wi.phase == "pre_entry" and (wi.last_score or 0) >= wi.threshold:
-                    # Confirm entry, switch to post_entry, do not stop watching
-                    src_chat = parsed.get("_meta", {}).get("src_chat_id")
-                    if src_chat and _should_alert("enter_confirm", cooldown_sec=600):
-                        await tg.send_message(src_chat, f"✅ {symbol}: сетап подтвердился (score {wi.last_score}/100). Можно входить.")
-                    # Forward to channel as official entry
-                    try:
-                        from ai_agent_bot import forward_to_channel
-                        await forward_to_channel(tg, parsed, (llm_res or {}))
-                        REG.last_forwarded_keys[wi.key] = time.time()
-                        wi.forwarded = True
-                    except Exception:
-                        pass
-                    wi.phase = "post_entry"
-                    if wi.entry_price is None:
-                        wi.entry_price = parsed.get("current_price") or px_now
-                    wi.holding_since = wi.holding_since or time.time()
+                if wi.phase == "pre_entry":
+                    # entry-window open/close with hysteresis and debounce (2 bars)
+                    open_gate = FORWARD_THRESHOLD
+                    close_gate = max(0, FORWARD_THRESHOLD - ENTRY_HYSTERESIS)
+                    llm_rec = ((llm_res or {}).get("action") or {}).get("recommendation", "").lower()
+                    cond_ok = (wi.last_score or 0) >= open_gate and llm_rec != "avoid" and not ((vol_ctx or {}).get("spike") and ((direction=="long" and (vol_ctx or {}).get("dir")=="down") or (direction=="short" and (vol_ctx or {}).get("dir")=="up")))
+                    if cond_ok:
+                        wi._entry_ok_streak = min(10, (wi._entry_ok_streak or 0) + 1)
+                        wi._entry_bad_streak = 0
+                    else:
+                        wi._entry_bad_streak = min(10, (wi._entry_bad_streak or 0) + 1)
+                        wi._entry_ok_streak = 0
+                    if not wi.entry_window_open and wi._entry_ok_streak >= 2:
+                        wi.entry_window_open = True
+                        # announce entry window open (not more often than cooldown)
+                        if _should_alert("entry_open", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60):
+                            try:
+                                src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                                rr = None
+                                try:
+                                    cp = parsed.get("current_price") or px_now
+                                    if cp is not None and wi.sl is not None and wi.tp is not None:
+                                        num = abs(float(wi.tp) - float(cp))
+                                        den = max(1e-9, abs(float(cp) - float(wi.sl)))
+                                        rr = num / den
+                                except Exception:
+                                    rr = None
+                                rr_txt = f" RR={round(rr,2)}" if rr is not None else ""
+                                if src_chat:
+                                    await tg.send_message(src_chat, f"✅ {symbol} {direction.upper()} — окно входа открыто.{rr_txt}")
+                            except Exception:
+                                pass
+                    # close window if conditions fade out (hysteresis close gate or avoid)
+                    cond_close = (wi.entry_window_open and (((wi.last_score or 0) <= close_gate) or llm_rec == "avoid"))
+                    if cond_close and wi._entry_bad_streak >= 2:
+                        wi.entry_window_open = False
+                        if _should_alert("entry_close", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60):
+                            try:
+                                src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                                if src_chat:
+                                    await tg.send_message(src_chat, f"ℹ️ {symbol} — окно входа закрыто (условия рассеялись).")
+                            except Exception:
+                                pass
+                    # promote to post_entry when window is open and LLM explicitly says enter
+                    if wi.entry_window_open and llm_rec == "enter":
+                        src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                        if src_chat and _should_alert("enter_confirm", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60):
+                            await tg.send_message(src_chat, f"✅ {symbol}: сетап подтверждён, можно входить.")
+                        try:
+                            from ai_agent_bot import forward_to_channel
+                            await forward_to_channel(tg, parsed, (llm_res or {}))
+                            REG.last_forwarded_keys[wi.key] = time.time()
+                            wi.forwarded = True
+                        except Exception:
+                            pass
+                        wi.phase = "post_entry"
+                        if wi.entry_price is None:
+                            wi.entry_price = parsed.get("current_price") or px_now
+                        wi.holding_since = wi.holding_since or time.time()
                 elif wi.phase == "post_entry":
-                    # Weakening alert
-                    if (wi.last_score or 0) < 40 and _should_alert("weak_post", cooldown_sec=1200):
+                    # Weakening alert (not more than DANGER cooldown)
+                    if (wi.last_score or 0) < DOWNGRADE_SCORE and _should_alert("weak_post", cooldown_sec=DANGER_ALERT_COOLDOWN_MIN*60):
                         src_chat = parsed.get("_meta", {}).get("src_chat_id")
                         if src_chat:
                             await tg.send_message(src_chat, f"⚠️ {symbol}: тренд ослаб, стоит подумать о частичной фиксации.")
@@ -398,6 +474,76 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                                 await tg.send_message(FORWARD_TARGET_ID, f"⚠️ [{symbol}] k={kshort} — тренд ослаб, возможна частичная фиксация.")
                         except Exception:
                             pass
+                    # Exit by score gate
+                    if (wi.last_score or 100) <= EXIT_SCORE and _should_alert("exit_score", cooldown_sec=10):
+                        src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                        if src_chat:
+                            await tg.send_message(src_chat, f"⛔️ {symbol}: устойчивое ухудшение (score {wi.last_score}/100). Выход из позиции.")
+                        if FORWARD_TARGET_ID:
+                            try:
+                                kshort = wi.key[:6]
+                                await tg.send_message(FORWARD_TARGET_ID, f"⛔️ [{symbol}] k={kshort} — выход по ухудшению score={wi.last_score}/100.")
+                            except Exception:
+                                pass
+                        REG.watches.pop(wi.key, None)
+                        return
+                    # TP extension logic (3h cooldown)
+                    try:
+                        if _should_alert("tp_extend_chk", cooldown_sec=TP_EXTEND_COOLDOWN_MIN*60):
+                            atr4 = (((llm_payload or {}).get("taapi") or {}).get("atr") or {}).get("4h")
+                            if isinstance(atr4, (int, float)) and atr4 > 0 and px_now is not None:
+                                # establish base tp cap
+                                if wi._base_tp_initial is None and wi.tp is not None:
+                                    wi._base_tp_initial = float(wi.tp)
+                                base_cap = None
+                                try:
+                                    if wi._base_tp_initial is not None:
+                                        base_cap = float(wi._base_tp_initial) * (1.0 + (TP_EXTENSION_MAX if direction=="long" else -TP_EXTENSION_MAX))
+                                except Exception:
+                                    base_cap = None
+                                step = float(atr4) * TP_EXTENSION_STEP_ATR4H
+                                if direction == "long":
+                                    proposed = max(float(wi.tp or px_now), float(px_now) + step)
+                                    if base_cap is not None:
+                                        proposed = min(proposed, base_cap)
+                                else:
+                                    proposed = min(float(wi.tp or px_now), float(px_now) - step)
+                                    if base_cap is not None:
+                                        proposed = max(proposed, base_cap)
+                                min_delta = float(atr4) * TP_EXTENSION_MIN_DELTA_ATR
+                                can_raise = False
+                                try:
+                                    if wi.tp is not None:
+                                        can_raise = (direction=="long" and (proposed - float(wi.tp)) >= min_delta) or (direction=="short" and (float(wi.tp) - proposed) >= min_delta)
+                                except Exception:
+                                    can_raise = False
+                                # only if trend is healthy
+                                score_series = wi.payload.get("_score_series") or []
+                                healthy = False
+                                try:
+                                    if len(score_series) >= 8:
+                                        a = sum(score_series[-8:]) / 8.0
+                                        b = sum(score_series[-16:-8]) / 8.0 if len(score_series) >= 16 else a
+                                        healthy = (a >= 70 and a >= b and (wi.last_score or 0) >= HOLD_MIN_SCORE)
+                                except Exception:
+                                    healthy = False
+                                if can_raise and healthy:
+                                    old_tp = wi.tp
+                                    wi.tp = float(proposed)
+                                    src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                                    try:
+                                        if src_chat:
+                                            await tg.send_message(src_chat, f"🎯 {symbol} — TP повышен до {wi.tp} (+{TP_EXTENSION_STEP_ATR4H}×ATR4h).")
+                                    except Exception:
+                                        pass
+                                    if FORWARD_TARGET_ID:
+                                        try:
+                                            kshort = wi.key[:6]
+                                            await tg.send_message(FORWARD_TARGET_ID, f"🎯 [{symbol}] k={kshort} — TP повышен до {wi.tp}.")
+                                        except Exception:
+                                            pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception:
