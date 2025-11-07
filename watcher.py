@@ -220,6 +220,12 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         src_chat = parsed.get("_meta", {}).get("src_chat_id")
                         if src_chat:
                             await tg.send_message(src_chat, f"⛔️ {symbol}: цена {px_now:.4f} пробила жёсткий SL {float(hard_sl):.4f}. Наблюдение остановлено.")
+                        if FORWARD_TARGET_ID:
+                            try:
+                                kshort = wi.key[:6]
+                                await tg.send_message(FORWARD_TARGET_ID, f"⛔️ [{symbol}] k={kshort} — пробит жёсткий SL ({px_now:.4f} vs {float(hard_sl):.4f}).")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     REG.watches.pop(wi.key, None)
@@ -273,13 +279,31 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         await tg.send_message(src_chat, f"📈 {symbol}: тренд усиливается, держим позицию. Score {wi.last_score}/100.")
                     except Exception:
                         pass
+                    try:
+                        if FORWARD_TARGET_ID:
+                            kshort = wi.key[:6]
+                            await tg.send_message(FORWARD_TARGET_ID, f"📈 [{symbol}] k={kshort} — держим позицию. Score {wi.last_score}/100.")
+                    except Exception:
+                        pass
                 if rec in ("avoid", "exit_immediate") and src_chat and _should_alert(rec):
                     if rec == "avoid":
                         msg = f"⚠️ {symbol}: условия ухудшились — вход ОТМЕНИТЬ. Причина: {act.get('reason','')}"
                         await tg.send_message(src_chat, msg)
+                        try:
+                            if FORWARD_TARGET_ID:
+                                kshort = wi.key[:6]
+                                await tg.send_message(FORWARD_TARGET_ID, f"⚠️ [{symbol}] k={kshort} — вход ОТМЕНИТЬ. {act.get('reason','')}")
+                        except Exception:
+                            pass
                     else:
                         msg = f"⛔️ {symbol}: выход ИЗ ПОЗИЦИИ (немедленно). Причина: {act.get('reason','')}"
                         await tg.send_message(src_chat, msg)
+                        try:
+                            if FORWARD_TARGET_ID:
+                                kshort = wi.key[:6]
+                                await tg.send_message(FORWARD_TARGET_ID, f"⛔️ [{symbol}] k={kshort} — выход ИЗ ПОЗИЦИИ. {act.get('reason','')}")
+                        except Exception:
+                            pass
                         REG.watches.pop(wi.key, None)
                         return
                 # promote phase if LLM signals post_entry explicitly
@@ -300,6 +324,12 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     src_chat = parsed.get("_meta", {}).get("src_chat_id")
                     if src_chat:
                         await tg.send_message(src_chat, f"⚠️ {symbol}: score упал до {wi.last_score}/100 — идею лучше ОТМЕНИТЬ.")
+                    try:
+                        if FORWARD_TARGET_ID:
+                            kshort = wi.key[:6]
+                            await tg.send_message(FORWARD_TARGET_ID, f"⚠️ [{symbol}] k={kshort} — score={wi.last_score}/100 → лучше отменить.")
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Update history with latest indicators snapshot for dynamics
@@ -344,6 +374,14 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     src_chat = parsed.get("_meta", {}).get("src_chat_id")
                     if src_chat and _should_alert("enter_confirm", cooldown_sec=600):
                         await tg.send_message(src_chat, f"✅ {symbol}: сетап подтвердился (score {wi.last_score}/100). Можно входить.")
+                    # Forward to channel as official entry
+                    try:
+                        from ai_agent_bot import forward_to_channel
+                        await forward_to_channel(tg, parsed, (llm_res or {}))
+                        REG.last_forwarded_keys[wi.key] = time.time()
+                        wi.forwarded = True
+                    except Exception:
+                        pass
                     wi.phase = "post_entry"
                     if wi.entry_price is None:
                         wi.entry_price = parsed.get("current_price") or px_now
@@ -354,6 +392,12 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         src_chat = parsed.get("_meta", {}).get("src_chat_id")
                         if src_chat:
                             await tg.send_message(src_chat, f"⚠️ {symbol}: тренд ослаб, стоит подумать о частичной фиксации.")
+                        try:
+                            if FORWARD_TARGET_ID:
+                                kshort = wi.key[:6]
+                                await tg.send_message(FORWARD_TARGET_ID, f"⚠️ [{symbol}] k={kshort} — тренд ослаб, возможна частичная фиксация.")
+                        except Exception:
+                            pass
             except Exception:
                 pass
         except Exception:
