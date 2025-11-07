@@ -289,7 +289,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     val = llm_res.get("score")
                     if isinstance(val, (int, float)):
                         sc = int(val)
-                        wi.last_score = sc
+            wi.last_score = sc
                 except Exception:
                     pass
             # fast-TF snapshot for telemetry
@@ -525,7 +525,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                             from ai_agent_bot import forward_to_channel
                             await forward_to_channel(tg, parsed, (llm_res or {}))
                             REG.last_forwarded_keys[wi.key] = time.time()
-                            wi.forwarded = True
+                wi.forwarded = True
                         except Exception:
                             pass
                         wi.phase = "post_entry"
@@ -565,13 +565,13 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                                 await tg.send_message(FORWARD_TARGET_ID, f"⛔️ [{symbol}] k={kshort} — выход по ухудшению score={wi.last_score}/100.")
                             except Exception:
                                 pass
-                        REG.watches.pop(wi.key, None)
-                        return
+                REG.watches.pop(wi.key, None)
+                return
                     # TP extension logic (3h cooldown)
                     try:
                         cd_tp_ok = _should_alert("tp_extend_chk", cooldown_sec=TP_EXTEND_COOLDOWN_MIN*60)
-                            atr4 = (((llm_payload or {}).get("taapi") or {}).get("atr") or {}).get("4h")
-                            if isinstance(atr4, (int, float)) and atr4 > 0 and px_now is not None:
+                        atr4 = (((llm_payload or {}).get("taapi") or {}).get("atr") or {}).get("4h")
+                        if isinstance(atr4, (int, float)) and atr4 > 0 and px_now is not None:
                                 # establish base tp cap
                                 if wi._base_tp_initial is None and wi.tp is not None:
                                     wi._base_tp_initial = float(wi.tp)
@@ -582,11 +582,11 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                                 except Exception:
                                     base_cap = None
                                 step = float(atr4) * TP_EXTENSION_STEP_ATR4H
-                                if direction == "long":
+                            if direction == "long":
                                     proposed = max(float(wi.tp or px_now), float(px_now) + step)
                                     if base_cap is not None:
                                         proposed = min(proposed, base_cap)
-                                else:
+                            else:
                                     proposed = min(float(wi.tp or px_now), float(px_now) - step)
                                     if base_cap is not None:
                                         proposed = max(proposed, base_cap)
