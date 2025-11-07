@@ -565,72 +565,72 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                                 await tg.send_message(FORWARD_TARGET_ID, f"⛔️ [{symbol}] k={kshort} — выход по ухудшению score={wi.last_score}/100.")
                             except Exception:
                                 pass
-                REG.watches.pop(wi.key, None)
-                return
+                        REG.watches.pop(wi.key, None)
+                        return
                     # TP extension logic (3h cooldown)
                     try:
                         cd_tp_ok = _should_alert("tp_extend_chk", cooldown_sec=TP_EXTEND_COOLDOWN_MIN*60)
                         atr4 = (((llm_payload or {}).get("taapi") or {}).get("atr") or {}).get("4h")
                         if isinstance(atr4, (int, float)) and atr4 > 0 and px_now is not None:
-                                # establish base tp cap
-                                if wi._base_tp_initial is None and wi.tp is not None:
-                                    wi._base_tp_initial = float(wi.tp)
+                            # establish base tp cap
+                            if wi._base_tp_initial is None and wi.tp is not None:
+                                wi._base_tp_initial = float(wi.tp)
+                            base_cap = None
+                            try:
+                                if wi._base_tp_initial is not None:
+                                    base_cap = float(wi._base_tp_initial) * (1.0 + (TP_EXTENSION_MAX if direction=="long" else -TP_EXTENSION_MAX))
+                            except Exception:
                                 base_cap = None
-                                try:
-                                    if wi._base_tp_initial is not None:
-                                        base_cap = float(wi._base_tp_initial) * (1.0 + (TP_EXTENSION_MAX if direction=="long" else -TP_EXTENSION_MAX))
-                                except Exception:
-                                    base_cap = None
-                                step = float(atr4) * TP_EXTENSION_STEP_ATR4H
+                            step = float(atr4) * TP_EXTENSION_STEP_ATR4H
                             if direction == "long":
-                                    proposed = max(float(wi.tp or px_now), float(px_now) + step)
-                                    if base_cap is not None:
-                                        proposed = min(proposed, base_cap)
+                                proposed = max(float(wi.tp or px_now), float(px_now) + step)
+                                if base_cap is not None:
+                                    proposed = min(proposed, base_cap)
                             else:
-                                    proposed = min(float(wi.tp or px_now), float(px_now) - step)
-                                    if base_cap is not None:
-                                        proposed = max(proposed, base_cap)
-                                min_delta = float(atr4) * TP_EXTENSION_MIN_DELTA_ATR
+                                proposed = min(float(wi.tp or px_now), float(px_now) - step)
+                                if base_cap is not None:
+                                    proposed = max(proposed, base_cap)
+                            min_delta = float(atr4) * TP_EXTENSION_MIN_DELTA_ATR
+                            can_raise = False
+                            try:
+                                if wi.tp is not None:
+                                    can_raise = (direction=="long" and (proposed - float(wi.tp)) >= min_delta) or (direction=="short" and (float(wi.tp) - proposed) >= min_delta)
+                            except Exception:
                                 can_raise = False
-                                try:
-                                    if wi.tp is not None:
-                                        can_raise = (direction=="long" and (proposed - float(wi.tp)) >= min_delta) or (direction=="short" and (float(wi.tp) - proposed) >= min_delta)
-                                except Exception:
-                                    can_raise = False
-                                # only if trend is healthy
-                                score_series = wi.payload.get("_score_series") or []
+                            # only if trend is healthy
+                            score_series = wi.payload.get("_score_series") or []
+                            healthy = False
+                            try:
+                                if len(score_series) >= 8:
+                                    a = sum(score_series[-8:]) / 8.0
+                                    b = sum(score_series[-16:-8]) / 8.0 if len(score_series) >= 16 else a
+                                    healthy = (a >= 70 and a >= b and (wi.last_score or 0) >= HOLD_MIN_SCORE)
+                            except Exception:
                                 healthy = False
+                            try:
+                                logger.info(
+                                    "[watcher] tp_extend: atr4h=%.6f step=%.6f proposed=%.6f prev_tp=%s cap_ok=%s min_delta_ok=%s cooldown_ok=%s healthy=%s",
+                                    float(atr4), float(step), float(proposed), str(wi.tp),
+                                    (base_cap is None or (direction=="long" and proposed <= base_cap) or (direction=="short" and proposed >= base_cap)),
+                                    bool(can_raise), bool(cd_tp_ok), bool(healthy)
+                                )
+                            except Exception:
+                                pass
+                            if can_raise and healthy and cd_tp_ok:
+                                old_tp = wi.tp
+                                wi.tp = float(proposed)
+                                src_chat = parsed.get("_meta", {}).get("src_chat_id")
                                 try:
-                                    if len(score_series) >= 8:
-                                        a = sum(score_series[-8:]) / 8.0
-                                        b = sum(score_series[-16:-8]) / 8.0 if len(score_series) >= 16 else a
-                                        healthy = (a >= 70 and a >= b and (wi.last_score or 0) >= HOLD_MIN_SCORE)
-                                except Exception:
-                                    healthy = False
-                                try:
-                                    logger.info(
-                                        "[watcher] tp_extend: atr4h=%.6f step=%.6f proposed=%.6f prev_tp=%s cap_ok=%s min_delta_ok=%s cooldown_ok=%s healthy=%s",
-                                        float(atr4), float(step), float(proposed), str(wi.tp),
-                                        (base_cap is None or (direction=="long" and proposed <= base_cap) or (direction=="short" and proposed >= base_cap)),
-                                        bool(can_raise), bool(cd_tp_ok), bool(healthy)
-                                    )
+                                    if src_chat:
+                                        await tg.send_message(src_chat, f"🎯 {symbol} — TP повышен до {wi.tp} (+{TP_EXTENSION_STEP_ATR4H}×ATR4h).")
                                 except Exception:
                                     pass
-                                if can_raise and healthy and cd_tp_ok:
-                                    old_tp = wi.tp
-                                    wi.tp = float(proposed)
-                                    src_chat = parsed.get("_meta", {}).get("src_chat_id")
+                                if FORWARD_TARGET_ID:
                                     try:
-                                        if src_chat:
-                                            await tg.send_message(src_chat, f"🎯 {symbol} — TP повышен до {wi.tp} (+{TP_EXTENSION_STEP_ATR4H}×ATR4h).")
+                                        kshort = wi.key[:6]
+                                        await tg.send_message(FORWARD_TARGET_ID, f"🎯 [{symbol}] k={kshort} — TP повышен до {wi.tp}.")
                                     except Exception:
                                         pass
-                                    if FORWARD_TARGET_ID:
-                                        try:
-                                            kshort = wi.key[:6]
-                                            await tg.send_message(FORWARD_TARGET_ID, f"🎯 [{symbol}] k={kshort} — TP повышен до {wi.tp}.")
-                                        except Exception:
-                                            pass
                     except Exception:
                         pass
             except Exception:
