@@ -289,9 +289,9 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     val = llm_res.get("score")
                     if isinstance(val, (int, float)):
                         sc = int(val)
-            wi.last_score = sc
                 except Exception:
                     pass
+            wi.last_score = sc
             # fast-TF snapshot for telemetry
             try:
                 tf_fast = (llm_payload or {}).get("taapi") or {}
