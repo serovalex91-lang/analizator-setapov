@@ -252,10 +252,16 @@ async def fetch_taapi_bundle(symbol_usdt: str, skip_heavy_tf: bool = False) -> d
         uco = skip_heavy_tf
         adx4   = asyncio.create_task(taapi_get(client, "adx",   slash, "4h",  use_cache_only=uco))
         adx12  = asyncio.create_task(taapi_get(client, "adx",   slash, "12h", use_cache_only=uco))
+        adx1h  = asyncio.create_task(taapi_get(client, "adx",   slash, "1h",  use_cache_only=False))
+        adx15  = asyncio.create_task(taapi_get(client, "adx",   slash, "15m", use_cache_only=False))
+        adx15_bt1 = asyncio.create_task(taapi_get(client, "adx", slash, "15m", extra={"backtrack": 1}, use_cache_only=False))
         dmi4   = asyncio.create_task(taapi_get(client, "dmi",   slash, "4h",  use_cache_only=uco))
         dmi12  = asyncio.create_task(taapi_get(client, "dmi",   slash, "12h", use_cache_only=uco))
         macd4  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}, use_cache_only=uco))
         macd12 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}, use_cache_only=uco))
+        macd1h = asyncio.create_task(taapi_get(client, "macd",  slash, "1h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}, use_cache_only=False))
+        macd15 = asyncio.create_task(taapi_get(client, "macd",  slash, "15m", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9}, use_cache_only=False))
+        macd15_bt1 = asyncio.create_task(taapi_get(client, "macd",slash, "15m", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}, use_cache_only=False))
         macd4_bt1  = asyncio.create_task(taapi_get(client, "macd",  slash, "4h",  extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}, use_cache_only=uco))
         macd12_bt1 = asyncio.create_task(taapi_get(client, "macd",  slash, "12h", extra={"optInFastPeriod": 12, "optInSlowPeriod": 26, "optInSignalPeriod": 9, "backtrack": 1}, use_cache_only=uco))
         atr4   = asyncio.create_task(taapi_get(client, "atr",   slash, "4h",  use_cache_only=uco))
@@ -265,13 +271,13 @@ async def fetch_taapi_bundle(symbol_usdt: str, skip_heavy_tf: bool = False) -> d
         obv_now= asyncio.create_task(taapi_get(client, "obv",   slash, "4h",  use_cache_only=False))
         obv_bt = asyncio.create_task(taapi_get(client, "obv",   slash, "4h", extra={"backtrack": 20}, use_cache_only=False))
         rsi12  = asyncio.create_task(taapi_get(client, "rsi",   slash, "12h", extra={"optInMAType": 1, "backtrack": 0, "close": 1}, use_cache_only=uco))
+        rsi15  = asyncio.create_task(taapi_get(client, "rsi",   slash, "15m", extra={"optInMAType": 1, "backtrack": 0, "close": 1}, use_cache_only=False))
+        rsi15_bt1 = asyncio.create_task(taapi_get(client, "rsi", slash, "15m", extra={"optInMAType": 1, "backtrack": 1, "close": 1}, use_cache_only=False))
         ema200 = asyncio.create_task(taapi_get(client, "ema",   slash, "12h", extra={"period": 200}, use_cache_only=uco))
 
         # ждем
-        adx4, adx12, dmi4, dmi12, macd4, macd12, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, ema200, \
-        macd4_bt1, macd12_bt1 = await asyncio.gather(
-            adx4, adx12, dmi4, dmi12, macd4, macd12, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, ema200,
-            macd4_bt1, macd12_bt1
+        adx4, adx12, adx1h, adx15, adx15_bt1, dmi4, dmi12, macd4, macd12, macd1h, macd15, macd15_bt1, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, rsi15, rsi15_bt1, ema200, macd4_bt1, macd12_bt1 = await asyncio.gather(
+            adx4, adx12, adx1h, adx15, adx15_bt1, dmi4, dmi12, macd4, macd12, macd1h, macd15, macd15_bt1, atr4, atr12, mfi4, bb4, obv_now, obv_bt, rsi12, rsi15, rsi15_bt1, ema200, macd4_bt1, macd12_bt1
         )
 
     # нормализация
@@ -281,6 +287,7 @@ async def fetch_taapi_bundle(symbol_usdt: str, skip_heavy_tf: bool = False) -> d
         return _to_float(x.get("value") or x.get("valueAdx") or x.get("adx") or x.get("result"))
 
     adx = {"4h": _adx_val(adx4), "12h": _adx_val(adx12)}
+    adx_fast = {"1h": _adx_val(adx1h), "15m": _adx_val(adx15), "15m_prev": _adx_val(adx15_bt1)}
     dmi = {"4h": map_dmi(dmi4), "12h": map_dmi(dmi12)}
     # фолбэк, если dmi пустой или без значений (не дергаем plusdi/minusdi — используем dmi только)
     def pick(x, *keys):
@@ -308,8 +315,10 @@ async def fetch_taapi_bundle(symbol_usdt: str, skip_heavy_tf: bool = False) -> d
         return None
     # no extra calls to plusdi/minusdi; if DMI missing values, keep None
     macd = {"4h": map_macd(macd4), "12h": map_macd(macd12)}
+    macd_fast = {"1h": map_macd(macd1h), "15m": map_macd(macd15), "15m_prev": map_macd(macd15_bt1)}
     atr = {"4h": _to_float(atr4.get("value") if atr4 else None), "12h": _to_float(atr12.get("value") if atr12 else None)}
     mfi = {"4h": _to_float(mfi4.get("value") if mfi4 else None)}
+    rsi_fast = {"15m": _to_float(rsi15.get("value") if rsi15 else None), "15m_prev": _to_float(rsi15_bt1.get("value") if rsi15_bt1 else None)}
     bb_width = {"4h": map_bb_width(bb4)}
     # extract bb levels for percent_b calculation later
     bb_upper = (bb4 or {}).get("valueUpper") or (bb4 or {}).get("valueUpperBand") or (bb4 or {}).get("upper")
@@ -346,11 +355,14 @@ async def fetch_taapi_bundle(symbol_usdt: str, skip_heavy_tf: bool = False) -> d
 
     return {
         "adx": adx,
+        "adx_fast": adx_fast,
         "dmi": dmi,
         "macd": macd,
+        "macd_fast": macd_fast,
         "macd_prev": {"4h": {"hist": (map_macd(macd4_bt1) or {}).get("hist")}, "12h": {"hist": (map_macd(macd12_bt1) or {}).get("hist")}},
         "atr": atr,
         "mfi": mfi,
+        "rsi_fast": rsi_fast,
         "bb_width": bb_width,
         "bb": {"4h": {"upper": bb_upper, "lower": bb_lower, "middle": bb_middle}},
         "obv": {"4h_trend": obv_trend},
@@ -451,10 +463,13 @@ def build_llm_payload(parsed: dict, taapi_bundle: dict, last_price: Optional[flo
         },
         "taapi": {
             "adx": taapi_bundle.get("adx"),
+            "adx_fast": taapi_bundle.get("adx_fast"),
             "dmi": taapi_bundle.get("dmi"),
             "macd": taapi_bundle.get("macd"),
+            "macd_fast": taapi_bundle.get("macd_fast"),
             "atr": taapi_bundle.get("atr"),
             "mfi": taapi_bundle.get("mfi"),
+            "rsi_fast": taapi_bundle.get("rsi_fast"),
             "bb_width": taapi_bundle.get("bb_width"),
             "obv": taapi_bundle.get("obv"),
             "filters": {
