@@ -525,7 +525,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                             from ai_agent_bot import forward_to_channel
                             await forward_to_channel(tg, parsed, (llm_res or {}))
                             REG.last_forwarded_keys[wi.key] = time.time()
-                wi.forwarded = True
+                            wi.forwarded = True
                         except Exception:
                             pass
                         wi.phase = "post_entry"
