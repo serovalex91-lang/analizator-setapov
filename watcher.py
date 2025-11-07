@@ -292,7 +292,44 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         wi.last_score = sc
                 except Exception:
                     pass
-            logger.info("WATCH tick: key=%s last_score=%s threshold=%s", wi.key, (wi.last_score if wi.last_score is not None else "n/a"), wi.threshold)
+            # fast-TF snapshot for telemetry
+            try:
+                tf_fast = (llm_payload or {}).get("taapi") or {}
+                adx1h = ((tf_fast.get("adx_fast") or {}).get("1h"))
+                adx15 = ((tf_fast.get("adx_fast") or {}).get("15m"))
+                macd1h = ((tf_fast.get("macd_fast") or {}).get("1h") or {}).get("hist")
+                macd15 = ((tf_fast.get("macd_fast") or {}).get("15m") or {}).get("hist")
+                rsi15 = ((tf_fast.get("rsi_fast") or {}).get("15m"))
+            except Exception:
+                adx1h = adx15 = macd1h = macd15 = rsi15 = None
+
+            # RR feasibility
+            rr_ok = None
+            try:
+                cp = parsed.get("current_price") or px_now
+                if cp is not None and wi.sl is not None and wi.tp is not None:
+                    num = abs(float(wi.tp) - float(cp))
+                    den = max(1e-9, abs(float(cp) - float(wi.sl)))
+                    rr_ok = (num / den) >= 3.0
+            except Exception:
+                rr_ok = None
+
+            logger.info(
+                "[watcher] tick: key=%s phase=%s last_score=%s score_known=%s rr_ok=%s entry_window=%s",
+                wi.key,
+                wi.phase,
+                (wi.last_score if wi.last_score is not None else "n/a"),
+                (wi.last_score is not None),
+                rr_ok,
+                ("open" if getattr(wi, "entry_window_open", False) else "closed"),
+            )
+            try:
+                logger.info(
+                    "[watcher] fast_tf: m15(adx=%s, macd_hist=%s, rsi=%s) h1(adx=%s, macd_hist=%s)",
+                    adx15, macd15, rsi15, adx1h, macd1h,
+                )
+            except Exception:
+                pass
             # keep a small buffer of scores for trend checks
             try:
                 score_series = (wi.payload.get("_score_series") or [])
@@ -398,6 +435,16 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                 if block_by_volume:
                     # soften by reducing score to avoid forwarding
                     wi.last_score = max(0, (wi.last_score or 0) - 10)
+                try:
+                    logger.info(
+                        "[watcher] opp_spike_block=%s (5m ret=%.2f%%, v_now=%.2f, median=%.2f)",
+                        bool(block_by_volume),
+                        float((vol_ctx or {}).get("ret5m") or 0.0),
+                        float((vol_ctx or {}).get("v_now") or 0.0),
+                        float((vol_ctx or {}).get("median_v") or 0.0),
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -415,10 +462,19 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     else:
                         wi._entry_bad_streak = min(10, (wi._entry_bad_streak or 0) + 1)
                         wi._entry_ok_streak = 0
-                    if not wi.entry_window_open and wi._entry_ok_streak >= 2:
+                    debounce_ok = wi._entry_ok_streak >= 2
+                    if not wi.entry_window_open and debounce_ok:
                         wi.entry_window_open = True
                         # announce entry window open (not more often than cooldown)
-                        if _should_alert("entry_open", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60):
+                        cooldown_ok = _should_alert("entry_open", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60)
+                        try:
+                            logger.info(
+                                "[watcher] entry_window open (reason=score>=%, debounce_ok=%s, hysteresis_gate=%s, cooldown_ok=%s)",
+                                open_gate, debounce_ok, open_gate, cooldown_ok,
+                            )
+                        except Exception:
+                            pass
+                        if cooldown_ok:
                             try:
                                 src_chat = parsed.get("_meta", {}).get("src_chat_id")
                                 rr = None
@@ -437,9 +493,18 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                                 pass
                     # close window if conditions fade out (hysteresis close gate or avoid)
                     cond_close = (wi.entry_window_open and (((wi.last_score or 0) <= close_gate) or llm_rec == "avoid"))
-                    if cond_close and wi._entry_bad_streak >= 2:
+                    debounce_bad_ok = wi._entry_bad_streak >= 2
+                    if cond_close and debounce_bad_ok:
                         wi.entry_window_open = False
-                        if _should_alert("entry_close", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60):
+                        cooldown_ok = _should_alert("entry_close", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60)
+                        try:
+                            logger.info(
+                                "[watcher] entry_window close (reason=cond_close, debounce_ok=%s, hysteresis_gate=%s, cooldown_ok=%s)",
+                                debounce_bad_ok, close_gate, cooldown_ok,
+                            )
+                        except Exception:
+                            pass
+                        if cooldown_ok:
                             try:
                                 src_chat = parsed.get("_meta", {}).get("src_chat_id")
                                 if src_chat:
@@ -449,7 +514,12 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                     # promote to post_entry when window is open and LLM explicitly says enter
                     if wi.entry_window_open and llm_rec == "enter":
                         src_chat = parsed.get("_meta", {}).get("src_chat_id")
-                        if src_chat and _should_alert("enter_confirm", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60):
+                        cooldown_ok = _should_alert("enter_confirm", cooldown_sec=ENTRY_ALERT_COOLDOWN_MIN*60)
+                        try:
+                            logger.info("[watcher] notify enter_confirm (cooldown_ok=%s)", cooldown_ok)
+                        except Exception:
+                            pass
+                        if src_chat and cooldown_ok:
                             await tg.send_message(src_chat, f"✅ {symbol}: сетап подтверждён, можно входить.")
                         try:
                             from ai_agent_bot import forward_to_channel
@@ -464,7 +534,12 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         wi.holding_since = wi.holding_since or time.time()
                 elif wi.phase == "post_entry":
                     # Weakening alert (not more than DANGER cooldown)
-                    if (wi.last_score or 0) < DOWNGRADE_SCORE and _should_alert("weak_post", cooldown_sec=DANGER_ALERT_COOLDOWN_MIN*60):
+                    cooldown_ok = _should_alert("weak_post", cooldown_sec=DANGER_ALERT_COOLDOWN_MIN*60)
+                    try:
+                        logger.info("[watcher] danger_check (score=%s < %s) cooldown_ok=%s", (wi.last_score or 0), DOWNGRADE_SCORE, cooldown_ok)
+                    except Exception:
+                        pass
+                    if (wi.last_score or 0) < DOWNGRADE_SCORE and cooldown_ok:
                         src_chat = parsed.get("_meta", {}).get("src_chat_id")
                         if src_chat:
                             await tg.send_message(src_chat, f"⚠️ {symbol}: тренд ослаб, стоит подумать о частичной фиксации.")
@@ -475,7 +550,12 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         except Exception:
                             pass
                     # Exit by score gate
-                    if (wi.last_score or 100) <= EXIT_SCORE and _should_alert("exit_score", cooldown_sec=10):
+                    exit_cd_ok = _should_alert("exit_score", cooldown_sec=10)
+                    try:
+                        logger.info("[watcher] exit_check (score=%s <= %s) cooldown_ok=%s", (wi.last_score or 0), EXIT_SCORE, exit_cd_ok)
+                    except Exception:
+                        pass
+                    if (wi.last_score or 100) <= EXIT_SCORE and exit_cd_ok:
                         src_chat = parsed.get("_meta", {}).get("src_chat_id")
                         if src_chat:
                             await tg.send_message(src_chat, f"⛔️ {symbol}: устойчивое ухудшение (score {wi.last_score}/100). Выход из позиции.")
@@ -489,7 +569,7 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                         return
                     # TP extension logic (3h cooldown)
                     try:
-                        if _should_alert("tp_extend_chk", cooldown_sec=TP_EXTEND_COOLDOWN_MIN*60):
+                        cd_tp_ok = _should_alert("tp_extend_chk", cooldown_sec=TP_EXTEND_COOLDOWN_MIN*60)
                             atr4 = (((llm_payload or {}).get("taapi") or {}).get("atr") or {}).get("4h")
                             if isinstance(atr4, (int, float)) and atr4 > 0 and px_now is not None:
                                 # establish base tp cap
@@ -527,7 +607,16 @@ async def _watch_loop(tg, wi: WatchItem) -> None:
                                         healthy = (a >= 70 and a >= b and (wi.last_score or 0) >= HOLD_MIN_SCORE)
                                 except Exception:
                                     healthy = False
-                                if can_raise and healthy:
+                                try:
+                                    logger.info(
+                                        "[watcher] tp_extend: atr4h=%.6f step=%.6f proposed=%.6f prev_tp=%s cap_ok=%s min_delta_ok=%s cooldown_ok=%s healthy=%s",
+                                        float(atr4), float(step), float(proposed), str(wi.tp),
+                                        (base_cap is None or (direction=="long" and proposed <= base_cap) or (direction=="short" and proposed >= base_cap)),
+                                        bool(can_raise), bool(cd_tp_ok), bool(healthy)
+                                    )
+                                except Exception:
+                                    pass
+                                if can_raise and healthy and cd_tp_ok:
                                     old_tp = wi.tp
                                     wi.tp = float(proposed)
                                     src_chat = parsed.get("_meta", {}).get("src_chat_id")

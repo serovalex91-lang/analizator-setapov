@@ -557,6 +557,30 @@ async def main() -> None:
             "CFG: FORWARD_THRESHOLD=%s WATCH_THRESHOLD=%s WATCH_WINDOW_HOURS=%s WATCH_INTERVAL_MIN=%s FORWARD_TARGET_ID=%s",
             FORWARD_THRESHOLD, WATCH_THRESHOLD, WATCH_WINDOW_HOURS, WATCH_INTERVAL_MIN, FORWARD_TARGET_ID,
         )
+        # extra telemetry for fast-TF, hysteresis and cooldowns
+        try:
+            fast_tf_enabled = os.getenv("FAST_TF_ENABLED") or "1"
+            fast_tf_cap = os.getenv("FAST_TF_SCORE_CAP") or "10"
+            entry_hyst = os.getenv("ENTRY_HYSTERESIS") or "5"
+            entry_conf_req = os.getenv("ENTRY_M15_CONF_REQUIRED") or "2"
+            entry_debounce = os.getenv("ENTRY_M15_DEBOUNCE_BARS") or "2"
+            cd_entry = os.getenv("ENTRY_ALERT_COOLDOWN_MIN") or "60"
+            cd_hold = os.getenv("HOLD_ALERT_COOLDOWN_MIN") or "120"
+            cd_tp = os.getenv("TP_EXTEND_COOLDOWN_MIN") or "180"
+            cd_danger = os.getenv("DANGER_ALERT_COOLDOWN_MIN") or "60"
+            tp_cap = os.getenv("TP_EXTENSION_MAX") or "0.20"
+            tp_step = os.getenv("TP_EXTENSION_STEP_ATR4H") or "1.0"
+            tp_min_delta = os.getenv("TP_EXTENSION_MIN_DELTA_ATR") or "0.5"
+            logger.info(
+                "CFG2: FAST_TF_ENABLED=%s FAST_TF_SCORE_CAP=%s ENTRY_M15_CONF_REQUIRED=%s ENTRY_M15_DEBOUNCE_BARS=%s ENTRY_HYSTERESIS=%s",
+                fast_tf_enabled, fast_tf_cap, entry_conf_req, entry_debounce, entry_hyst,
+            )
+            logger.info(
+                "CFG3: ENTRY_ALERT_COOLDOWN_MIN=%s HOLD_ALERT_COOLDOWN_MIN=%s TP_EXTEND_COOLDOWN_MIN=%s DANGER_ALERT_COOLDOWN_MIN=%s TP_EXTENSION_MAX=%s TP_EXTENSION_STEP_ATR4H=%s TP_EXTENSION_MIN_DELTA_ATR=%s",
+                cd_entry, cd_hold, cd_tp, cd_danger, tp_cap, tp_step, tp_min_delta,
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
