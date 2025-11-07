@@ -277,7 +277,7 @@ async def maybe_forward_or_watch(tg: TelegramClient, parsed: dict, llm_result: d
             pass
         # Auto-start watcher in post_entry phase for accompaniment
         try:
-            MAX_ACTIVE_WATCHERS = int(os.getenv("MAX_ACTIVE_WATCHERS", "3"))
+            MAX_ACTIVE_WATCHERS = int(os.getenv("MAX_ACTIVE_WATCHERS", "30"))
             if len(REG.watches) < MAX_ACTIVE_WATCHERS and key not in REG.watches:
                 now = time.time()
                 wi = WatchItem(
@@ -302,7 +302,7 @@ async def maybe_forward_or_watch(tg: TelegramClient, parsed: dict, llm_result: d
         # enqueue watch if not exists
         try:
             # limit concurrent watches
-            MAX_ACTIVE_WATCHERS = int(os.getenv("MAX_ACTIVE_WATCHERS", "3"))
+            MAX_ACTIVE_WATCHERS = int(os.getenv("MAX_ACTIVE_WATCHERS", "30"))
             if len(REG.watches) >= MAX_ACTIVE_WATCHERS:
                 return
             if key not in REG.watches:
